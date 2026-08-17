@@ -189,6 +189,25 @@ func TestMetadataRefusesWhatCannotBeCompared(t *testing.T) {
 	}
 }
 
+// RFC 9728 puts the well-known segment between the origin and the path. For a
+// resource at /mcp, appending would point clients at
+// /mcp/.well-known/oauth-protected-resource, a URL nothing serves.
+func TestMetadataPointerForAPathBearingResource(t *testing.T) {
+	g := &Guard{
+		Metadata: NewMetadata("https://mcp.example.com/mcp", "https://auth.example.com"),
+		Verifier: stubVerifier{err: ErrNoToken},
+	}
+	r := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/mcp", nil)
+	w := httptest.NewRecorder()
+	g.Handler(okHandler()).ServeHTTP(w, r)
+
+	challenge := w.Header().Get("WWW-Authenticate")
+	want := `resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"`
+	if !strings.Contains(challenge, want) {
+		t.Errorf("challenge = %q, want it to carry %s", challenge, want)
+	}
+}
+
 func TestMisconfiguredGuardFailsLoudly(t *testing.T) {
 	g := &Guard{Metadata: NewMetadata(resource, "https://auth.example.com")}
 	if response := call(g, okHandler(), "Bearer abc"); response.Code != http.StatusInternalServerError {

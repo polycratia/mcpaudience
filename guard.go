@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -112,9 +113,20 @@ func writeChallenge(w http.ResponseWriter, metadataURL string, err error) {
 	http.Error(w, err.Error(), code)
 }
 
+// metadataURL builds the pointer per RFC 9728 §3.1: the well-known segment is
+// inserted between the origin and the resource's path, not appended after it.
+// For https://mcp.example.com/mcp the document lives at
+// https://mcp.example.com/.well-known/oauth-protected-resource/mcp — appending
+// would send clients to a URL nothing serves.
 func (g *Guard) metadataURL() string {
 	if g.Metadata.Resource == "" {
 		return ""
 	}
-	return strings.TrimSuffix(g.Metadata.Resource, "/") + MetadataPath
+	parsed, err := url.Parse(g.Metadata.Resource)
+	if err != nil {
+		return ""
+	}
+	path := strings.TrimSuffix(parsed.Path, "/")
+	parsed.Path = MetadataPath + path
+	return parsed.String()
 }
