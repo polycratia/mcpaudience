@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 )
 
@@ -85,7 +84,7 @@ func BearerToken(r *http.Request) (string, error) {
 }
 
 func (g *Guard) challenge(w http.ResponseWriter, err error) {
-	writeChallenge(w, g.metadataURL(), err)
+	writeChallenge(w, g.Metadata.URL(), err)
 }
 
 // writeChallenge answers 401 with the WWW-Authenticate header that tells a
@@ -111,22 +110,4 @@ func writeChallenge(w http.ResponseWriter, metadataURL string, err error) {
 
 	w.Header().Set("WWW-Authenticate", strings.Join(parts, ", "))
 	http.Error(w, err.Error(), code)
-}
-
-// metadataURL builds the pointer per RFC 9728 §3.1: the well-known segment is
-// inserted between the origin and the resource's path, not appended after it.
-// For https://mcp.example.com/mcp the document lives at
-// https://mcp.example.com/.well-known/oauth-protected-resource/mcp — appending
-// would send clients to a URL nothing serves.
-func (g *Guard) metadataURL() string {
-	if g.Metadata.Resource == "" {
-		return ""
-	}
-	parsed, err := url.Parse(g.Metadata.Resource)
-	if err != nil {
-		return ""
-	}
-	path := strings.TrimSuffix(parsed.Path, "/")
-	parsed.Path = MetadataPath + path
-	return parsed.String()
 }

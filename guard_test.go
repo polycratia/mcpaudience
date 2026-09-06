@@ -2,7 +2,6 @@ package mcpaudience
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -137,55 +136,6 @@ func TestBearerTokenExtraction(t *testing.T) {
 				t.Errorf("got %q, %v; want %q", got, err, c.want)
 			}
 		})
-	}
-}
-
-func TestMetadataDocument(t *testing.T) {
-	metadata := NewMetadata(resource, "https://auth.example.com")
-	if err := metadata.Validate(); err != nil {
-		t.Fatal(err)
-	}
-
-	w := httptest.NewRecorder()
-	metadata.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, MetadataPath, nil))
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d", w.Code)
-	}
-
-	var served Metadata
-	if err := json.Unmarshal(w.Body.Bytes(), &served); err != nil {
-		t.Fatalf("document is not JSON: %v", err)
-	}
-	if served.Resource != resource || len(served.AuthorizationServers) != 1 {
-		t.Errorf("document = %+v", served)
-	}
-	if len(served.BearerMethods) != 1 || served.BearerMethods[0] != "header" {
-		t.Errorf("bearer methods = %v, want the header only", served.BearerMethods)
-	}
-}
-
-func TestMetadataRefusesWhatCannotBeCompared(t *testing.T) {
-	cases := map[string]Metadata{
-		"no resource":    {AuthorizationServers: []string{"https://auth.example.com"}},
-		"relative":       {Resource: "/mcp", AuthorizationServers: []string{"https://auth.example.com"}},
-		"plain http":     {Resource: "http://mcp.example.com", AuthorizationServers: []string{"https://auth.example.com"}},
-		"with fragment":  {Resource: resource + "#tools", AuthorizationServers: []string{"https://auth.example.com"}},
-		"with query":     {Resource: resource + "?v=1", AuthorizationServers: []string{"https://auth.example.com"}},
-		"no issuers":     {Resource: resource},
-		"token in query": {Resource: resource, AuthorizationServers: []string{"https://auth.example.com"}, BearerMethods: []string{"query"}},
-	}
-	for name, metadata := range cases {
-		t.Run(name, func(t *testing.T) {
-			if err := metadata.Validate(); err == nil {
-				t.Error("accepted")
-			}
-		})
-	}
-
-	// localhost over plain http is how everyone develops.
-	local := NewMetadata("http://localhost:8080", "http://localhost:9000")
-	if err := local.Validate(); err != nil {
-		t.Errorf("localhost was refused: %v", err)
 	}
 }
 

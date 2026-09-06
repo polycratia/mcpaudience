@@ -31,7 +31,8 @@ WWW-Authenticate: Bearer error="insufficient_scope", error_description="token do
 
 ```go
 guard := &mcpaudience.Guard{
-	Metadata: mcpaudience.NewMetadata("https://mcp.example.com", "https://auth.example.com"),
+	Metadata: mcpaudience.NewMetadata("https://mcp.example.com", "https://auth.example.com").
+		WithScopes("files:read", "files:delete"),
 	Verifier: &mcpaudience.JWTVerifier{
 		Resource: "https://mcp.example.com",
 		Issuers:  []string{"https://auth.example.com"},
@@ -43,11 +44,28 @@ tools := http.NewServeMux()
 tools.Handle("/tools/list", listFiles)
 tools.Handle("/tools/delete", mcpaudience.Require(deleteFile, "files:delete"))
 
-http.Handle("/.well-known/oauth-protected-resource", guard.Metadata.Handler())
-http.Handle("/", guard.Handler(tools))
+mux := http.NewServeMux()
+guard.Metadata.Mount(mux) // /.well-known/oauth-protected-resource
+mux.Handle("/", guard.Handler(tools))
 ```
 
 Inside a tool, `mcpaudience.ClaimsFrom(r.Context())` gives the verified claims.
+
+## Discovery
+
+`Mount` puts the document at the URL the `401` advertises, and RFC 9728 §3.1 is
+fussy about which one that is: the well-known segment goes between the origin
+and the resource's path, not after it. A server whose resource identifier is
+`https://mcp.example.com/mcp` publishes at
+`https://mcp.example.com/.well-known/oauth-protected-resource/mcp` —
+`guard.Metadata.URL()` returns that value, and it is the same string the
+challenge carries.
+
+`scopes_supported` is a hint for the client's token request. It decides nothing:
+what a token may do is settled on the request, against the scopes it actually
+carries. A document that would not survive `Validate` is never published — the
+handler answers `500` instead, because sending a client to an issuer this server
+will not accept tokens from is worse than serving nothing at all.
 
 ## What it is not
 
@@ -93,7 +111,7 @@ Early. It covers the resource-server side and says where it stops.
 
 | | |
 |---|---|
-| Implemented | RFC 9728 metadata document, audience binding, RS256/ES256 verification, expiry with clock skew, issuer allow-list, per-tool scopes, `WWW-Authenticate` challenges |
+| Implemented | RFC 9728 metadata document and endpoint, audience binding, RS256/ES256 verification, expiry with clock skew, issuer allow-list, per-tool scopes, `WWW-Authenticate` challenges |
 | Not yet | JWKS fetching and key rotation, RFC 7662 introspection for opaque tokens, resource indicators on the client side, token caching |
 
 The MCP authorization specification is young and has changed more than once. This
@@ -112,4 +130,4 @@ make demo   # the transcript above
 
 ## License
 
-MIT
+MIT, by [polycratia](https://polycratia.com) — <hey@polycratia.com>.

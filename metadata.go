@@ -37,7 +37,9 @@ type Metadata struct {
 	ResourceDocs         string   `json:"resource_documentation,omitempty"`
 }
 
-// MetadataPath is where the document is served, per RFC 9728.
+// MetadataPath is the well-known segment the document is served under, per
+// RFC 9728. For a resource with a path of its own the document sits below it;
+// WellKnownPath works that out.
 const MetadataPath = "/.well-known/oauth-protected-resource"
 
 // NewMetadata builds a document with the defaults an MCP server wants: the
@@ -50,6 +52,14 @@ func NewMetadata(resource string, authorizationServers ...string) Metadata {
 		AuthorizationServers: authorizationServers,
 		BearerMethods:        []string{"header"},
 	}
+}
+
+// WithScopes advertises the scopes a client may ask its authorization server
+// for. The list is a hint for discovery, never a decision: what a token is
+// allowed to do is settled here, on the request, against the scopes it carries.
+func (m Metadata) WithScopes(scopes ...string) Metadata {
+	m.ScopesSupported = scopes
+	return m
 }
 
 // Validate refuses a document a client could not act on.
@@ -75,17 +85,56 @@ func (m Metadata) Validate() error {
 	return nil
 }
 
-// Handler serves the metadata document.
+// WellKnownPath is the path the document has to be served at, per RFC 9728
+// §3.1: the well-known segment goes between the origin and the resource's path,
+// not after it. A server at https://mcp.example.com/mcp publishes at
+// /.well-known/oauth-protected-resource/mcp, and appending instead would leave
+// clients fetching a URL nothing serves.
+func (m Metadata) WellKnownPath() string {
+	parsed, err := url.Parse(m.Resource)
+	if err != nil {
+		return MetadataPath
+	}
+	return MetadataPath + strings.TrimSuffix(parsed.Path, "/")
+}
+
+// URL is the absolute location of the document: the value a 401 hands back in
+// resource_metadata, and the one clients will actually fetch.
+func (m Metadata) URL() string {
+	if strings.TrimSpace(m.Resource) == "" {
+		return ""
+	}
+	parsed, err := url.Parse(m.Resource)
+	if err != nil {
+		return ""
+	}
+	parsed.Path = MetadataPath + strings.TrimSuffix(parsed.Path, "/")
+	return parsed.String()
+}
+
+// Mount registers the document on mux at the path the challenge advertises, so
+// that discovery cannot drift from what the 401 promised.
+func (m Metadata) Mount(mux *http.ServeMux) {
+	mux.Handle(m.WellKnownPath(), m.Handler())
+}
+
+// Handler serves the metadata document. A document that would not survive
+// Validate is answered with a 500 instead: publishing one is worse than
+// publishing nothing, because it sends clients to fetch tokens this server has
+// already decided it will not accept.
 func (m Metadata) Handler() http.Handler {
+	if err := m.Validate(); err != nil {
+		message := "mcpaudience: metadata document is invalid: " + err.Error()
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, message, http.StatusInternalServerError)
+		})
+	}
+	body, _ := json.Marshal(m)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("allow", http.MethodGet)
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("allow", "GET, HEAD")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		body, err := json.Marshal(m)
-		if err != nil {
-			http.Error(w, "metadata could not be encoded", http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("content-type", "application/json")
