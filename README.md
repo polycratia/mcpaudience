@@ -80,7 +80,16 @@ is listed below rather than implied.
 
 ## Four refusals worth reading
 
-**The audience.** The reason this package has that name. Covered above.
+**The audience.** The reason this package has that name, and the one check with
+no configuration behind it: no field disables it, and no value of one skips it.
+A verifier with no resource identifier does not fall through to accepting
+anything — it refuses every token, and the guard answers `500`, because a server
+that cannot name itself cannot tell a token meant for it from one that is not.
+The same `500` answers a guard whose metadata advertises one resource while its
+verifier binds another, rather than sending clients to fetch a token this server
+has already decided to reject. Comparison is on the canonical form of both
+sides, so `HTTPS://MCP.Example.com:443` and `https://mcp.example.com` are one
+server; a different host, port or path is a different one.
 
 **`alg: none` and `alg: HS256`.** `none` means "trust me". An HMAC algorithm
 against a set of public keys is the algorithm-confusion attack: the attacker
@@ -111,7 +120,7 @@ Early. It covers the resource-server side and says where it stops.
 
 | | |
 |---|---|
-| Implemented | RFC 9728 metadata document and endpoint, audience binding, RS256/ES256 verification, expiry with clock skew, issuer allow-list, per-tool scopes, `WWW-Authenticate` challenges |
+| Implemented | RFC 9728 metadata document and endpoint, mandatory audience binding, RS256/ES256 verification, expiry with clock skew, issuer allow-list, per-tool scopes, `WWW-Authenticate` challenges |
 | Not yet | JWKS fetching and key rotation, RFC 7662 introspection for opaque tokens, resource indicators on the client side, token caching |
 
 The MCP authorization specification is young and has changed more than once. This

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -70,7 +71,52 @@ func (a Audience) MarshalJSON() ([]byte, error) {
 
 // Contains reports whether the audience names this resource.
 func (a Audience) Contains(resource string) bool {
-	return slices.Contains([]string(a), resource)
+	for _, value := range a {
+		if sameResource(value, resource) {
+			return true
+		}
+	}
+	return false
+}
+
+// sameResource compares two resource identifiers on their canonical form.
+//
+// The two failure modes are opposite and both real. Comparing raw strings
+// refuses a token that says HTTPS://MCP.Example.com:443 for a server that calls
+// itself https://mcp.example.com, which is the same server by every rule the
+// URI syntax has. Comparing loosely — prefixes, hosts by suffix, paths ignored —
+// accepts tokens minted for a neighbour. So: scheme and host case-folded, a
+// default port dropped, a trailing slash dropped, and everything else exact.
+func sameResource(a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	return canonicalResource(a) == canonicalResource(b)
+}
+
+func canonicalResource(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
+		return raw
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	host := strings.ToLower(parsed.Host)
+	switch {
+	case scheme == "https" && strings.HasSuffix(host, ":443"):
+		host = strings.TrimSuffix(host, ":443")
+	case scheme == "http" && strings.HasSuffix(host, ":80"):
+		host = strings.TrimSuffix(host, ":80")
+	}
+
+	canonical := scheme + "://" + host + strings.TrimSuffix(parsed.EscapedPath(), "/")
+	if parsed.RawQuery != "" {
+		canonical += "?" + parsed.RawQuery
+	}
+	if parsed.Fragment != "" {
+		canonical += "#" + parsed.EscapedFragment()
+	}
+	return canonical
 }
 
 // Reasons a token is refused. They are distinguished because the WWW-
@@ -87,18 +133,31 @@ var (
 	ErrMissingScope   = errors.New("token does not carry the required scope")
 )
 
+// ErrNoResource is a server fault rather than a bad token: without a resource
+// identifier there is nothing to bind an audience to. It answers 500, because a
+// 401 would blame the client for a mistake it cannot fix.
+var ErrNoResource = errors.New("no resource identifier configured: audience binding cannot be skipped")
+
 // checkStandard applies the checks every verifier owes, whatever it used to
 // authenticate the token.
 //
 // The audience check is the one that cannot be optional: without it this server
 // accepts any valid token from a trusted issuer, including one a user granted
-// to a completely different service, and becomes that service's deputy.
+// to a completely different service, and becomes that service's deputy. There
+// is no field that disables it and no value of one that skips it — an empty
+// resource stops the server instead of opening it.
 func checkStandard(claims Claims, resource string, issuers []string, now time.Time, skew time.Duration) error {
+	if strings.TrimSpace(resource) == "" {
+		return ErrNoResource
+	}
 	if !claims.Active {
 		return ErrInactive
 	}
 	if len(issuers) > 0 && !slices.Contains(issuers, claims.Issuer) {
 		return fmt.Errorf("%w: %q", ErrUnknownIssuer, claims.Issuer)
+	}
+	if len(claims.Audience) == 0 {
+		return fmt.Errorf("%w: the token names no audience at all", ErrWrongAudience)
 	}
 	if !claims.Audience.Contains(resource) {
 		return fmt.Errorf("%w: audience %v does not include %q", ErrWrongAudience, []string(claims.Audience), resource)

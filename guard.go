@@ -27,6 +27,10 @@ func (g *Guard) Handler(next http.Handler) http.Handler {
 			http.Error(w, "mcpaudience: no verifier configured", http.StatusInternalServerError)
 			return
 		}
+		if err := g.checkBinding(); err != nil {
+			http.Error(w, "mcpaudience: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 		token, err := BearerToken(r)
 		if err != nil {
 			g.challenge(w, err)
@@ -43,6 +47,25 @@ func (g *Guard) Handler(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(withClaims(r.Context(), claims)))
 	})
+}
+
+// checkBinding refuses to serve when the resource the challenge advertises is
+// not the one tokens are checked against. A client that follows the 401 would
+// come back with a token for the advertised resource, this server would reject
+// it as the wrong audience, and the loop would look like a client bug.
+func (g *Guard) checkBinding() error {
+	binder, ok := g.Verifier.(ResourceBinder)
+	if !ok {
+		return nil
+	}
+	bound := binder.BoundResource()
+	if strings.TrimSpace(bound) == "" {
+		return ErrNoResource
+	}
+	if advertised := g.Metadata.Resource; advertised != "" && !sameResource(advertised, bound) {
+		return fmt.Errorf("the metadata advertises %q but tokens are bound to %q", advertised, bound)
+	}
+	return nil
 }
 
 // Require guards one tool or route behind its own scopes, on top of whatever
@@ -91,6 +114,13 @@ func (g *Guard) challenge(w http.ResponseWriter, err error) {
 // client where to get a token — the discovery step RFC 9728 adds, and the
 // reason a client does not have to be configured with an issuer in advance.
 func writeChallenge(w http.ResponseWriter, metadataURL string, err error) {
+	if errors.Is(err, ErrNoResource) {
+		// The server cannot name itself, so it cannot tell a token meant for it
+		// from one that is not. That is this server's fault, not the client's.
+		http.Error(w, "mcpaudience: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	code := http.StatusUnauthorized
 	parts := []string{`Bearer error="invalid_token"`}
 

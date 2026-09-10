@@ -19,10 +19,18 @@ type Verifier interface {
 	Verify(ctx context.Context, token string) (Claims, error)
 }
 
+// ResourceBinder is a Verifier that can say which resource it binds tokens to,
+// so a Guard can refuse to run when the challenge advertises one resource and
+// tokens are checked against another.
+type ResourceBinder interface {
+	BoundResource() string
+}
+
 // JWTVerifier validates a signed JWT against public keys it already holds.
 type JWTVerifier struct {
 	// Resource is this server's canonical URI: the value a token's audience
-	// must contain.
+	// must contain. It is required. Leaving it empty is not a way to accept
+	// tokens minted for anyone — it refuses every token instead.
 	Resource string
 	// Issuers the server trusts. Empty means any issuer, which is almost never
 	// what anyone wants.
@@ -34,6 +42,9 @@ type JWTVerifier struct {
 	// Now is injectable for tests.
 	Now func() time.Time
 }
+
+// BoundResource is the resource identifier a token's audience has to name.
+func (v *JWTVerifier) BoundResource() string { return v.Resource }
 
 type jwtHeader struct {
 	Algorithm string `json:"alg"`
