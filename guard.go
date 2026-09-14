@@ -41,8 +41,12 @@ func (g *Guard) Handler(next http.Handler) http.Handler {
 			g.challenge(w, err)
 			return
 		}
-		if len(g.RequiredScopes) > 0 && !claims.HasScope(g.RequiredScopes...) {
-			g.challenge(w, fmt.Errorf("%w: %s", ErrMissingScope, strings.Join(g.RequiredScopes, " ")))
+		if missing := claims.MissingScopes(g.RequiredScopes...); len(missing) > 0 {
+			g.challenge(w, &ScopeError{
+				Required: g.RequiredScopes,
+				Missing:  missing,
+				Granted:  claims.Scopes(),
+			})
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(withClaims(r.Context(), claims)))
@@ -69,13 +73,27 @@ func (g *Guard) checkBinding() error {
 }
 
 // Require guards one tool or route behind its own scopes, on top of whatever
-// the Guard already demanded.
+// the Guard already demanded. The denial names the tool by its request path;
+// RequireTool names it explicitly.
 //
 // This is the shape MCP servers actually need: one token, many tools, and only
 // some of them dangerous. A single scope for the whole server means the token
 // that lists files can also delete them.
 func Require(next http.Handler, scopes ...string) http.Handler {
+	return RequireTool("", next, scopes...)
+}
+
+// RequireTool is Require for a tool whose route is not the name its callers
+// know it by. The name ends up in the refusal, so it should be the one a client
+// can look up in its own tool list.
+func RequireTool(name string, next http.Handler, scopes ...string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(scopes) == 0 {
+			// A tool that requires nothing is not guarded, and reads at the call
+			// site as though it were.
+			http.Error(w, "mcpaudience: Require needs at least one scope", http.StatusInternalServerError)
+			return
+		}
 		claims, ok := ClaimsFrom(r.Context())
 		if !ok {
 			// Reaching here means Require was mounted outside the Guard, which
@@ -83,8 +101,17 @@ func Require(next http.Handler, scopes ...string) http.Handler {
 			http.Error(w, "mcpaudience: Require must be mounted inside Guard.Handler", http.StatusInternalServerError)
 			return
 		}
-		if !claims.HasScope(scopes...) {
-			writeChallenge(w, "", fmt.Errorf("%w: %s", ErrMissingScope, strings.Join(scopes, " ")))
+		tool := name
+		if tool == "" {
+			tool = r.URL.Path
+		}
+		if missing := claims.MissingScopes(scopes...); len(missing) > 0 {
+			writeChallenge(w, "", &ScopeError{
+				Tool:     tool,
+				Required: scopes,
+				Missing:  missing,
+				Granted:  claims.Scopes(),
+			})
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -132,6 +159,12 @@ func writeChallenge(w http.ResponseWriter, metadataURL string, err error) {
 		// a client off to fetch another token that would have the same scopes.
 		code = http.StatusForbidden
 		parts = []string{`Bearer error="insufficient_scope"`}
+		var scopeErr *ScopeError
+		if errors.As(err, &scopeErr) && len(scopeErr.Required) > 0 {
+			// RFC 6750 §3.1 has a field for this, so the requirement is one the
+			// client can read rather than one it has to parse out of prose.
+			parts = append(parts, fmt.Sprintf("scope=%q", strings.Join(scopeErr.Required, " ")))
+		}
 	}
 	parts = append(parts, fmt.Sprintf("error_description=%q", err.Error()))
 	if metadataURL != "" {

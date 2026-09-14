@@ -24,7 +24,8 @@ body: listed the files for user-1
 
 --- same token, reaching for a tool it was not granted ---
 status: 403
-WWW-Authenticate: Bearer error="insufficient_scope", error_description="token does not carry the required scope: files:delete"
+WWW-Authenticate: Bearer error="insufficient_scope", scope="files:delete", error_description="token does not carry the required scope: tool \"/tools/delete\" needs files:delete; the token carries files:read"
+body: token does not carry the required scope: tool "/tools/delete" needs files:delete; the token carries files:read
 ```
 
 ## Use
@@ -66,6 +67,32 @@ what a token may do is settled on the request, against the scopes it actually
 carries. A document that would not survive `Validate` is never published — the
 handler answers `500` instead, because sending a client to an issuer this server
 will not accept tokens from is worse than serving nothing at all.
+
+## Per-tool scopes, and denials that say what is missing
+
+One token, many tools, only some of them dangerous. `Require` puts a tool behind
+its own scopes on top of whatever the `Guard` already demanded, and the refusal
+is the part worth reading:
+
+```
+WWW-Authenticate: Bearer error="insufficient_scope", scope="files:delete",
+  error_description="token does not carry the required scope: tool "/tools/delete" needs files:delete; the token carries files:read"
+```
+
+A bare `403` tells a caller it lost without telling it what it was short of, and
+the next move is to guess: wrong token, wrong tool, wrong user, or a server bug.
+So the denial names the tool, names **only** the scopes the token was actually
+missing rather than the whole list the route asks for — otherwise callers go
+looking for scopes they already hold — and repeats what the token does carry, so
+the difference is visible without a debugger. The `scope` parameter is RFC 6750's
+own field for the requirement, which makes it something a client reads rather
+than parses out of prose.
+
+The tool names itself by its request path. `RequireTool("files/delete", …)` sets
+the name explicitly, for servers whose routes are not what clients call their
+tools. And `Require` with no scopes answers `500`, like mounting it outside the
+`Guard` does: a tool that requires nothing is not guarded, and it reads at the
+call site as though it were.
 
 ## What it is not
 
@@ -112,7 +139,8 @@ being configured by hand.
 
 `403` means "I know who you are and this is not yours". Missing scope answers
 `403`, never `401`: sending a client off to fetch another token would only get
-it the same scopes again.
+it the same scopes again — unless it asks for more, which is why the `403` says
+which scope, for which tool.
 
 ## Status
 
@@ -120,7 +148,7 @@ Early. It covers the resource-server side and says where it stops.
 
 | | |
 |---|---|
-| Implemented | RFC 9728 metadata document and endpoint, mandatory audience binding, RS256/ES256 verification, expiry with clock skew, issuer allow-list, per-tool scopes, `WWW-Authenticate` challenges |
+| Implemented | RFC 9728 metadata document and endpoint, mandatory audience binding, RS256/ES256 verification, expiry with clock skew, issuer allow-list, per-tool scopes with named denials, `WWW-Authenticate` challenges |
 | Not yet | JWKS fetching and key rotation, RFC 7662 introspection for opaque tokens, resource indicators on the client side, token caching |
 
 The MCP authorization specification is young and has changed more than once. This

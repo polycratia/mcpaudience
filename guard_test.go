@@ -33,7 +33,11 @@ func guard(v Verifier, scopes ...string) *Guard {
 }
 
 func call(g *Guard, handler http.Handler, authorization string) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(http.MethodPost, resource+"/mcp", nil)
+	return callPath(g, handler, "/mcp", authorization)
+}
+
+func callPath(g *Guard, handler http.Handler, path, authorization string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodPost, resource+path, nil)
 	if authorization != "" {
 		r.Header.Set("Authorization", authorization)
 	}
@@ -74,8 +78,12 @@ func TestMissingScopeIsForbiddenRatherThanUnauthorized(t *testing.T) {
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", response.Code)
 	}
-	if !strings.Contains(response.Header().Get("WWW-Authenticate"), "insufficient_scope") {
-		t.Errorf("challenge = %q, want insufficient_scope", response.Header().Get("WWW-Authenticate"))
+	challenge := response.Header().Get("WWW-Authenticate")
+	if !strings.Contains(challenge, "insufficient_scope") {
+		t.Errorf("challenge = %q, want insufficient_scope", challenge)
+	}
+	if !strings.Contains(challenge, "mcp:write") {
+		t.Errorf("challenge = %q, want it to name the scope the server demanded", challenge)
 	}
 }
 
@@ -92,6 +100,76 @@ func TestPerToolScopes(t *testing.T) {
 	dangerous := call(g, Require(okHandler(), "files:delete"), "Bearer abc")
 	if dangerous.Code != http.StatusForbidden {
 		t.Errorf("delete tool: status = %d, want 403 for a token that only reads", dangerous.Code)
+	}
+}
+
+// A bare 403 leaves the caller to guess between a wrong token, a wrong tool and
+// a server bug. The denial names both the tool and the scope it wanted.
+func TestADenialNamesTheToolAndTheMissingScope(t *testing.T) {
+	v := stubVerifier{claims: Claims{Subject: "user-1", Scope: "files:read", Active: true}}
+	response := callPath(guard(v), Require(okHandler(), "files:delete"), "/tools/delete", "Bearer abc")
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", response.Code)
+	}
+	challenge := response.Header().Get("WWW-Authenticate")
+	if !strings.Contains(challenge, `scope="files:delete"`) {
+		t.Errorf("challenge = %q, want the RFC 6750 scope parameter", challenge)
+	}
+	for _, want := range []string{"/tools/delete", "files:delete", "files:read"} {
+		if !strings.Contains(challenge, want) {
+			t.Errorf("challenge = %q, want it to mention %q", challenge, want)
+		}
+	}
+	if !strings.Contains(response.Body.String(), "/tools/delete") {
+		t.Errorf("body = %q, want the tool named there too", response.Body)
+	}
+}
+
+// Reporting the whole requirement as if it were the shortfall sends people
+// looking for scopes they already hold.
+func TestADenialNamesOnlyTheScopesTheTokenLacks(t *testing.T) {
+	claims := Claims{Scope: "files:read", Active: true}
+
+	missing := claims.MissingScopes("files:read", "files:delete")
+	if len(missing) != 1 || missing[0] != "files:delete" {
+		t.Fatalf("missing = %v, want only files:delete", missing)
+	}
+
+	denial := &ScopeError{Tool: "files/delete", Required: []string{"files:read", "files:delete"}, Missing: missing, Granted: claims.Scopes()}
+	if got := denial.Error(); !strings.Contains(got, `needs files:delete;`) {
+		t.Errorf("denial = %q, want it to name the shortfall rather than the whole requirement", got)
+	}
+}
+
+func TestADenialSaysSoWhenTheTokenCarriesNoScopesAtAll(t *testing.T) {
+	v := stubVerifier{claims: Claims{Subject: "user-1", Active: true}}
+	response := callPath(guard(v), Require(okHandler(), "files:delete"), "/tools/delete", "Bearer abc")
+
+	if !strings.Contains(response.Body.String(), "no scopes at all") {
+		t.Errorf("body = %q, want it to say the token carries nothing", response.Body)
+	}
+}
+
+// The route is not always the name a client knows the tool by.
+func TestRequireToolNamesTheToolRatherThanTheRoute(t *testing.T) {
+	v := stubVerifier{claims: Claims{Subject: "user-1", Scope: "files:read", Active: true}}
+	handler := RequireTool("files/delete", okHandler(), "files:delete")
+	response := callPath(guard(v), handler, "/rpc", "Bearer abc")
+
+	if !strings.Contains(response.Body.String(), "files/delete") {
+		t.Errorf("body = %q, want the declared tool name", response.Body)
+	}
+}
+
+// A tool that requires nothing reads at the call site as though it were
+// guarded, so it refuses to run rather than serving unguarded.
+func TestRequireWithNoScopesFailsLoudly(t *testing.T) {
+	v := stubVerifier{claims: Claims{Subject: "user-1", Scope: "files:read", Active: true}}
+	response := call(guard(v), Require(okHandler()), "Bearer abc")
+
+	if response.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", response.Code)
 	}
 }
 

@@ -33,13 +33,21 @@ func (c Claims) Scopes() []string {
 
 // HasScope reports whether every required scope is present.
 func (c Claims) HasScope(required ...string) bool {
+	return len(c.MissingScopes(required...)) == 0
+}
+
+// MissingScopes returns the required scopes this token does not carry, in the
+// order they were asked for. It is what turns a refusal into an instruction:
+// a tool that requires four scopes and refuses over one of them can say which.
+func (c Claims) MissingScopes(required ...string) []string {
 	granted := c.Scopes()
+	var missing []string
 	for _, scope := range required {
 		if !slices.Contains(granted, scope) {
-			return false
+			missing = append(missing, scope)
 		}
 	}
-	return true
+	return missing
 }
 
 // Audience is the aud claim, which JWT allows to be either a single string or
@@ -137,6 +145,36 @@ var (
 // identifier there is nothing to bind an audience to. It answers 500, because a
 // 401 would blame the client for a mistake it cannot fix.
 var ErrNoResource = errors.New("no resource identifier configured: audience binding cannot be skipped")
+
+// ScopeError is a denial a caller can act on. A bare 403 says only that the
+// request lost, which leaves four guesses on the table: wrong token, wrong
+// tool, wrong user, or a server bug. This one names the tool that refused, the
+// scopes it was missing, and what the token does carry instead.
+type ScopeError struct {
+	// Tool is the tool that refused. Empty means the whole server did.
+	Tool string
+	// Required is everything that tool asks for, Missing only the part this
+	// token did not have. They differ, and reporting the first as if it were
+	// the second sends people looking for scopes they already hold.
+	Required []string
+	Missing  []string
+	Granted  []string
+}
+
+func (e *ScopeError) Error() string {
+	subject := "this server"
+	if e.Tool != "" {
+		subject = fmt.Sprintf("tool %q", e.Tool)
+	}
+	carries := "no scopes at all"
+	if len(e.Granted) > 0 {
+		carries = strings.Join(e.Granted, " ")
+	}
+	return fmt.Sprintf("%s: %s needs %s; the token carries %s",
+		ErrMissingScope, subject, strings.Join(e.Missing, " "), carries)
+}
+
+func (e *ScopeError) Unwrap() error { return ErrMissingScope }
 
 // checkStandard applies the checks every verifier owes, whatever it used to
 // authenticate the token.
