@@ -94,6 +94,45 @@ tools. And `Require` with no scopes answers `500`, like mounting it outside the
 `Guard` does: a tool that requires nothing is not guarded, and it reads at the
 call site as though it were.
 
+## Keys, rotation and the clock
+
+`Keys` is the map you fill yourself. `KeySet` is the other way in — a JWKS
+endpoint, fetched on demand and kept in memory:
+
+```go
+Verifier: &mcpaudience.JWTVerifier{
+	Resource: "https://mcp.example.com",
+	Issuers:  []string{"https://auth.example.com"},
+	KeySet:   &mcpaudience.JWKS{URL: "https://auth.example.com/.well-known/jwks.json"},
+	Skew:     30 * time.Second,
+}
+```
+
+Rotation is why the cache is not a plain TTL. An authorization server starts
+signing with a new key the moment it publishes it, and a resource server that
+only refetches when its cache expires refuses every token minted in between —
+for minutes, over nothing. So an unknown `kid` is read as the signal it is, and
+refetches the set. That would also be a free way to make this server hammer its
+issuer, one request per invented key id, which is what `MinRefresh` is for: at
+most one fetch per interval, and a `kid` nobody published is refused from the
+copy already in memory.
+
+When the issuer cannot be reached, the last good set keeps answering. An issuer
+being down is not evidence that the key it published stopped being its key, and
+the tokens it signed expire on their own.
+
+Two refusals happen at fetch time rather than verify time. A key set URL that is
+not `https` is refused before the first request, because a key set an attacker
+on the path can replace is a key set that verifies the attacker's tokens. And a
+symmetric key in a published set — `{"kty":"oct"}` among public keys — is dropped
+when the document is read, with the reason kept so that a token naming that key
+id is told why rather than told "unknown".
+
+`Skew` is the allowance on `exp` and `nbf` for clocks that disagree, 60s by
+default. It is a tolerance, not a grace period: it moves the boundary by seconds
+in both directions, so that a token minted a moment ago by a server running
+slightly fast is not "not valid yet".
+
 ## What it is not
 
 **Not an authorization server.** It issues no tokens, runs no consent screen and
@@ -101,9 +140,10 @@ stores no clients. That belongs to an identity provider, and standing one up
 inside an MCP server is how "a week of work" becomes a month of work that has
 nothing to do with the tools you meant to expose.
 
-**Not a token-format library.** It verifies RS256 and ES256 JWTs against public
-keys you already hold. Fetching and rotating a JWKS is not implemented yet, and
-is listed below rather than implied.
+**Not a token-format library.** It verifies RS256 and ES256 JWTs, against public
+keys you already hold or a key set it fetches for you. Opaque tokens and the
+introspection endpoint that would validate them are not implemented, and are
+listed below rather than implied.
 
 ## Four refusals worth reading
 
@@ -148,8 +188,8 @@ Early. It covers the resource-server side and says where it stops.
 
 | | |
 |---|---|
-| Implemented | RFC 9728 metadata document and endpoint, mandatory audience binding, RS256/ES256 verification, expiry with clock skew, issuer allow-list, per-tool scopes with named denials, `WWW-Authenticate` challenges |
-| Not yet | JWKS fetching and key rotation, RFC 7662 introspection for opaque tokens, resource indicators on the client side, token caching |
+| Implemented | RFC 9728 metadata document and endpoint, mandatory audience binding, RS256/ES256 verification, JWKS fetching with rotation-aware caching, expiry with clock skew, issuer allow-list, per-tool scopes with named denials, `WWW-Authenticate` challenges |
+| Not yet | RFC 7662 introspection for opaque tokens, resource indicators on the client side, token caching |
 
 The MCP authorization specification is young and has changed more than once. This
 targets the resource-server behaviour that has been stable across those

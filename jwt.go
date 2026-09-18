@@ -26,7 +26,7 @@ type ResourceBinder interface {
 	BoundResource() string
 }
 
-// JWTVerifier validates a signed JWT against public keys it already holds.
+// JWTVerifier validates a signed JWT against public keys it holds or fetches.
 type JWTVerifier struct {
 	// Resource is this server's canonical URI: the value a token's audience
 	// must contain. It is required. Leaving it empty is not a way to accept
@@ -37,6 +37,9 @@ type JWTVerifier struct {
 	Issuers []string
 	// Keys by key id. Only public keys belong here.
 	Keys map[string]crypto.PublicKey
+	// KeySet is consulted for key ids Keys does not hold — a JWKS endpoint,
+	// usually.
+	KeySet KeySource
 	// Skew tolerated on expiry and not-before. Defaults to 60s.
 	Skew time.Duration
 	// Now is injectable for tests.
@@ -53,7 +56,7 @@ type jwtHeader struct {
 }
 
 // Verify checks the signature, then everything a signature does not say.
-func (v *JWTVerifier) Verify(_ context.Context, token string) (Claims, error) {
+func (v *JWTVerifier) Verify(ctx context.Context, token string) (Claims, error) {
 	if strings.TrimSpace(token) == "" {
 		return Claims{}, ErrNoToken
 	}
@@ -71,9 +74,9 @@ func (v *JWTVerifier) Verify(_ context.Context, token string) (Claims, error) {
 		return Claims{}, fmt.Errorf("%w: header: %v", ErrMalformedToken, err)
 	}
 
-	key, ok := v.Keys[header.KeyID]
-	if !ok {
-		return Claims{}, fmt.Errorf("%w: no key for kid %q", ErrBadSignature, header.KeyID)
+	key, err := v.key(ctx, header.KeyID)
+	if err != nil {
+		return Claims{}, err
 	}
 	signature, err := decodeSegment(parts[2])
 	if err != nil {
@@ -96,6 +99,27 @@ func (v *JWTVerifier) Verify(_ context.Context, token string) (Claims, error) {
 	claims.Active = true // a JWT has no active flag; it is live until it expires
 
 	return claims, checkStandard(claims, v.Resource, v.Issuers, v.now(), v.skew())
+}
+
+// key resolves the token's key id against the keys held here first and the key
+// set second, so a configured key is never overridden by a fetched one.
+func (v *JWTVerifier) key(ctx context.Context, kid string) (crypto.PublicKey, error) {
+	if key, ok := v.Keys[kid]; ok {
+		return key, nil
+	}
+	if v.KeySet == nil {
+		return nil, fmt.Errorf("%w: no key for kid %q", ErrBadSignature, kid)
+	}
+	if strings.TrimSpace(kid) == "" {
+		// Without a kid there is nothing to look up and nothing to rotate; a
+		// verifier that guesses picks the wrong key the first time one is added.
+		return nil, fmt.Errorf("%w: the token names no kid, so no key can be chosen", ErrBadSignature)
+	}
+	key, err := v.KeySet.Key(ctx, kid)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBadSignature, err)
+	}
+	return key, nil
 }
 
 // verifySignature refuses everything except the two asymmetric algorithms this
