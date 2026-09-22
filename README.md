@@ -26,6 +26,10 @@ body: listed the files for user-1
 status: 403
 WWW-Authenticate: Bearer error="insufficient_scope", scope="files:delete", error_description="token does not carry the required scope: tool \"/tools/delete\" needs files:delete; the token carries files:read"
 body: token does not carry the required scope: tool "/tools/delete" needs files:delete; the token carries files:read
+
+--- what reaches the tool ---
+status: 200
+body: subject=user-1 client=inspector scopes=files:read; asking for the raw token: no bearer token presented
 ```
 
 ## Use
@@ -50,7 +54,32 @@ guard.Metadata.Mount(mux) // /.well-known/oauth-protected-resource
 mux.Handle("/", guard.Handler(tools))
 ```
 
-Inside a tool, `mcpaudience.ClaimsFrom(r.Context())` gives the verified claims.
+## The principal, not the token
+
+A verified request reaches the tool as a `Principal` in its context:
+
+```go
+func deleteFile(w http.ResponseWriter, r *http.Request) {
+	principal, ok := mcpaudience.PrincipalFrom(r.Context())
+	if !ok {
+		http.Error(w, "this route is mounted outside the guard", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("%s deleting through %s", principal.Subject, principal.ClientID)
+}
+```
+
+Subject, client id, issuer, scopes, token id and expiry: who the request is
+running as, and nothing that can be spent. The token does not travel with it —
+the guard serves the tool a copy of the request with the `Authorization` header
+removed, so `BearerToken` inside a handler finds nothing. That is the point. A
+tool that can read the user's token can forward it to the next service, and a
+token forwarded onward is the same confused-deputy problem this package refuses
+at the door, arriving from the inside. A tool that has to call something else
+needs a credential of its own.
+
+The `false` return is worth handling rather than ignoring: it does not mean an
+anonymous caller, it means the handler is running outside the `Guard`.
 
 ## Discovery
 
@@ -188,7 +217,7 @@ Early. It covers the resource-server side and says where it stops.
 
 | | |
 |---|---|
-| Implemented | RFC 9728 metadata document and endpoint, mandatory audience binding, RS256/ES256 verification, JWKS fetching with rotation-aware caching, expiry with clock skew, issuer allow-list, per-tool scopes with named denials, `WWW-Authenticate` challenges |
+| Implemented | RFC 9728 metadata document and endpoint, mandatory audience binding, RS256/ES256 verification, JWKS fetching with rotation-aware caching, expiry with clock skew, issuer allow-list, per-tool scopes with named denials, `WWW-Authenticate` challenges, verified principal in the handler's context with the token stripped |
 | Not yet | RFC 7662 introspection for opaque tokens, resource indicators on the client side, token caching |
 
 The MCP authorization specification is young and has changed more than once. This

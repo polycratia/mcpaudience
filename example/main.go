@@ -1,6 +1,7 @@
-// Command example runs a guarded MCP endpoint and walks four requests through
-// it: no token, a token minted for another service, a valid token, and a valid
-// token reaching for a tool it was not granted.
+// Command example runs a guarded MCP endpoint and walks five requests through
+// it: no token, a token minted for another service, a valid token, a valid
+// token reaching for a tool it was not granted, and a tool reporting what it
+// can see of the caller.
 //
 //	go run ./example
 package main
@@ -15,6 +16,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"time"
 
 	"github.com/polycratia/mcpaudience"
@@ -43,6 +45,7 @@ func main() {
 	tools := http.NewServeMux()
 	tools.Handle("/tools/list", handler("listed the files"))
 	tools.Handle("/tools/delete", mcpaudience.Require(handler("deleted the file"), "files:delete"))
+	tools.Handle("/tools/whoami", http.HandlerFunc(whoami))
 
 	server := httptest.NewServer(guard.Handler(tools))
 	defer server.Close()
@@ -58,23 +61,36 @@ func main() {
 
 	fmt.Println("\n--- same token, reaching for a tool it was not granted ---")
 	show(get(server.URL+"/tools/delete", token(key, resource, "files:read")))
+
+	fmt.Println("\n--- what reaches the tool ---")
+	show(get(server.URL+"/tools/whoami", token(key, resource, "files:read")))
 }
 
 func handler(said string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		claims, _ := mcpaudience.ClaimsFrom(r.Context())
-		fmt.Fprintf(w, "%s for %s", said, claims.Subject)
+		principal, _ := mcpaudience.PrincipalFrom(r.Context())
+		fmt.Fprintf(w, "%s for %s", said, principal.Subject)
 	})
+}
+
+// whoami prints the principal the guard established and then asks for the
+// token, which is no longer there to be had.
+func whoami(w http.ResponseWriter, r *http.Request) {
+	principal, _ := mcpaudience.PrincipalFrom(r.Context())
+	_, err := mcpaudience.BearerToken(r)
+	fmt.Fprintf(w, "subject=%s client=%s scopes=%s; asking for the raw token: %v",
+		principal.Subject, principal.ClientID, strings.Join(principal.Scopes, " "), err)
 }
 
 func token(key *rsa.PrivateKey, audience, scope string) string {
 	header := segment(map[string]string{"alg": "RS256", "kid": "key-1", "typ": "JWT"})
 	payload := segment(map[string]any{
-		"iss":   issuer,
-		"sub":   "user-1",
-		"aud":   audience,
-		"exp":   time.Now().Add(time.Hour).Unix(),
-		"scope": scope,
+		"iss":       issuer,
+		"sub":       "user-1",
+		"aud":       audience,
+		"exp":       time.Now().Add(time.Hour).Unix(),
+		"scope":     scope,
+		"client_id": "inspector",
 	})
 	digest := sha256.Sum256([]byte(header + "." + payload))
 	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])

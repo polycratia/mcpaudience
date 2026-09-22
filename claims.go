@@ -40,7 +40,10 @@ func (c Claims) HasScope(required ...string) bool {
 // order they were asked for. It is what turns a refusal into an instruction:
 // a tool that requires four scopes and refuses over one of them can say which.
 func (c Claims) MissingScopes(required ...string) []string {
-	granted := c.Scopes()
+	return missingScopes(c.Scopes(), required)
+}
+
+func missingScopes(granted, required []string) []string {
 	var missing []string
 	for _, scope := range required {
 		if !slices.Contains(granted, scope) {

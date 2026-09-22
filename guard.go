@@ -20,7 +20,7 @@ type Guard struct {
 }
 
 // Handler wraps next so that only requests with a token for this resource
-// reach it.
+// reach it, and so that what reaches it is the principal rather than the token.
 func (g *Guard) Handler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if g.Verifier == nil {
@@ -41,15 +41,16 @@ func (g *Guard) Handler(next http.Handler) http.Handler {
 			g.challenge(w, err)
 			return
 		}
-		if missing := claims.MissingScopes(g.RequiredScopes...); len(missing) > 0 {
+		principal := claims.Principal()
+		if missing := principal.Missing(g.RequiredScopes...); len(missing) > 0 {
 			g.challenge(w, &ScopeError{
 				Required: g.RequiredScopes,
 				Missing:  missing,
-				Granted:  claims.Scopes(),
+				Granted:  principal.Scopes,
 			})
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(withClaims(r.Context(), claims)))
+		next.ServeHTTP(w, withPrincipal(r, principal))
 	})
 }
 
@@ -94,7 +95,7 @@ func RequireTool(name string, next http.Handler, scopes ...string) http.Handler 
 			http.Error(w, "mcpaudience: Require needs at least one scope", http.StatusInternalServerError)
 			return
 		}
-		claims, ok := ClaimsFrom(r.Context())
+		principal, ok := PrincipalFrom(r.Context())
 		if !ok {
 			// Reaching here means Require was mounted outside the Guard, which
 			// would leave the tool unprotected.
@@ -105,12 +106,12 @@ func RequireTool(name string, next http.Handler, scopes ...string) http.Handler 
 		if tool == "" {
 			tool = r.URL.Path
 		}
-		if missing := claims.MissingScopes(scopes...); len(missing) > 0 {
+		if missing := principal.Missing(scopes...); len(missing) > 0 {
 			writeChallenge(w, "", &ScopeError{
 				Tool:     tool,
 				Required: scopes,
 				Missing:  missing,
-				Granted:  claims.Scopes(),
+				Granted:  principal.Scopes,
 			})
 			return
 		}

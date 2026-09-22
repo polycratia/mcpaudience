@@ -2,10 +2,12 @@ package mcpaudience
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // stubVerifier stands in for a real token check so the guard's own behaviour is
@@ -19,8 +21,8 @@ func (s stubVerifier) Verify(context.Context, string) (Claims, error) { return s
 
 func okHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		claims, _ := ClaimsFrom(r.Context())
-		w.Write([]byte("served for " + claims.Subject))
+		principal, _ := PrincipalFrom(r.Context())
+		w.Write([]byte("served for " + principal.Subject))
 	})
 }
 
@@ -66,6 +68,72 @@ func TestAValidTokenReachesTheHandler(t *testing.T) {
 
 	if response.Code != http.StatusOK || response.Body.String() != "served for user-1" {
 		t.Errorf("status = %d, body = %q", response.Code, response.Body)
+	}
+}
+
+// The handler is told who the request is running as, and is not told what the
+// request was authenticated with: a tool holding a bearer token can spend it
+// on another service, which is the confused deputy arriving from the inside.
+func TestTheHandlerGetsThePrincipalAndNotTheToken(t *testing.T) {
+	v := stubVerifier{claims: Claims{
+		Issuer:    "https://auth.example.com",
+		Subject:   "user-1",
+		ClientID:  "app-7",
+		TokenID:   "jti-1",
+		Scope:     "files:read files:write",
+		ExpiresAt: now.Add(time.Hour).Unix(),
+		Active:    true,
+	}}
+
+	var seen Principal
+	var header string
+	var tokenErr error
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen, _ = PrincipalFrom(r.Context())
+		header = r.Header.Get("Authorization")
+		_, tokenErr = BearerToken(r)
+	})
+
+	if response := call(guard(v), handler, "Bearer the-secret-token"); response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.Code)
+	}
+
+	if seen.Subject != "user-1" || seen.ClientID != "app-7" || seen.Issuer != "https://auth.example.com" || seen.TokenID != "jti-1" {
+		t.Errorf("principal = %+v", seen)
+	}
+	if !seen.Has("files:read", "files:write") {
+		t.Errorf("scopes = %v, want both the token carried", seen.Scopes)
+	}
+	if !seen.ExpiresAt.Equal(now.Add(time.Hour)) {
+		t.Errorf("expiry = %v, want the exp claim", seen.ExpiresAt)
+	}
+	if header != "" {
+		t.Errorf("the handler was handed the raw token in %q", header)
+	}
+	if !errors.Is(tokenErr, ErrNoToken) {
+		t.Errorf("BearerToken inside the handler = %v, want ErrNoToken", tokenErr)
+	}
+}
+
+// Stripping the token is done on a copy: the request the guard was handed
+// belongs to whoever handed it over.
+func TestStrippingTheTokenLeavesTheCallersRequestAlone(t *testing.T) {
+	v := stubVerifier{claims: Claims{Subject: "user-1", Active: true}}
+	r := httptest.NewRequest(http.MethodPost, resource+"/mcp", nil)
+	r.Header.Set("Authorization", "Bearer abc")
+
+	guard(v).Handler(okHandler()).ServeHTTP(httptest.NewRecorder(), r)
+
+	if got := r.Header.Get("Authorization"); got != "Bearer abc" {
+		t.Errorf("Authorization on the original request = %q, want it untouched", got)
+	}
+}
+
+// No principal does not mean an anonymous caller, it means the handler is
+// running outside the guard.
+func TestNoPrincipalOutsideTheGuard(t *testing.T) {
+	if _, ok := PrincipalFrom(context.Background()); ok {
+		t.Error("a context that never passed the guard reported a principal")
 	}
 }
 
@@ -129,14 +197,14 @@ func TestADenialNamesTheToolAndTheMissingScope(t *testing.T) {
 // Reporting the whole requirement as if it were the shortfall sends people
 // looking for scopes they already hold.
 func TestADenialNamesOnlyTheScopesTheTokenLacks(t *testing.T) {
-	claims := Claims{Scope: "files:read", Active: true}
+	principal := Claims{Scope: "files:read", Active: true}.Principal()
 
-	missing := claims.MissingScopes("files:read", "files:delete")
+	missing := principal.Missing("files:read", "files:delete")
 	if len(missing) != 1 || missing[0] != "files:delete" {
 		t.Fatalf("missing = %v, want only files:delete", missing)
 	}
 
-	denial := &ScopeError{Tool: "files/delete", Required: []string{"files:read", "files:delete"}, Missing: missing, Granted: claims.Scopes()}
+	denial := &ScopeError{Tool: "files/delete", Required: []string{"files:read", "files:delete"}, Missing: missing, Granted: principal.Scopes}
 	if got := denial.Error(); !strings.Contains(got, `needs files:delete;`) {
 		t.Errorf("denial = %q, want it to name the shortfall rather than the whole requirement", got)
 	}
