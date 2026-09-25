@@ -81,6 +81,56 @@ needs a credential of its own.
 The `false` return is worth handling rather than ignoring: it does not mean an
 anonymous caller, it means the handler is running outside the `Guard`.
 
+## With a Go MCP SDK
+
+An SDK's streamable HTTP transport is an `http.Handler`, so the guard goes in
+front of it and the server behind it stays unaware that tokens exist:
+
+```go
+server := mcp.NewServer(&mcp.Implementation{Name: "files", Version: "0.1.0"}, nil)
+mcp.AddTool(server, &mcp.Tool{Name: "files/delete"}, deleteFile)
+
+mux := http.NewServeMux()
+guard.Metadata.Mount(mux)
+mux.Handle("/mcp", guard.Handler(
+	mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)))
+```
+
+`Require` has no part in this wiring, and that is the one thing worth knowing
+before reaching for it: every call arrives as a `tools/call` on the same route,
+so there is no per-tool route left to wrap. The scope check moves inside the
+tool, where the SDK hands the handler a context — the same context the guard put
+the principal on:
+
+```go
+func deleteFile(ctx context.Context, req *mcp.CallToolRequest, args deleteArgs) (*mcp.CallToolResult, any, error) {
+	principal, ok := mcpaudience.PrincipalFrom(ctx)
+	if !ok {
+		return nil, nil, errors.New("this tool is mounted outside the guard")
+	}
+	if missing := principal.Missing("files:delete"); len(missing) > 0 {
+		return nil, nil, &mcpaudience.ScopeError{
+			Tool:     "files/delete",
+			Required: []string{"files:delete"},
+			Missing:  missing,
+			Granted:  principal.Scopes,
+		}
+	}
+	…
+}
+```
+
+The two layers answer differently on purpose. A missing or foreign token is a
+transport failure and gets the `401` with `resource_metadata`, because the
+client has to go and get a different token. A token that is for this server but
+not for this tool reached the server legitimately, so the refusal comes back as
+an error on that call, naming the scope.
+
+`go run ./example/mcpsdk` runs the whole thing — discovery, a token minted for
+another service, a token for this one, a `tools/list` that lists only what the
+token can call, and a `tools/call` refused for the scope it lacked — against a
+stand-in for the SDK's transport, so the example stays dependency-free.
+
 ## Discovery
 
 `Mount` puts the document at the URL the `401` advertises, and RFC 9728 §3.1 is
@@ -230,8 +280,9 @@ Go 1.24 or newer. No dependencies outside the standard library.
 ## Development
 
 ```bash
-make test   # go vet + go test ./...
-make demo   # the transcript above
+make test      # go vet + go test ./...
+make demo      # the transcript above
+make demo-mcp  # the same guard in front of an MCP endpoint
 ```
 
 ## License
