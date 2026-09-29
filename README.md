@@ -131,6 +131,52 @@ another service, a token for this one, a `tools/list` that lists only what the
 token can call, and a `tools/call` refused for the scope it lacked — against a
 stand-in for the SDK's transport, so the example stays dependency-free.
 
+## What audience binding prevents
+
+The confused deputy is an old problem in a new place: a program holding more
+authority than its caller, talked into spending that authority on the caller's
+behalf. An MCP server is a deputy by construction. It holds the credentials for
+a filesystem, a ticket tracker, a production database, and it acts for whoever
+turns up with a token.
+
+Say an organisation runs two MCP servers — files and tickets — and both trust
+the same authorization server, which is the normal arrangement rather than an
+unlucky one. A user authorizes a client against tickets, and the issuer mints a
+token: signed with a key both servers verify against, live for the next hour,
+naming that user as its subject, carrying the scopes that user holds. Present it
+to the files server instead. Signature valid. Issuer on the allow-list. Expiry
+in the future. A verifier that stops there has just handed the ticket
+integration the user's files, and the audit log will say the user asked for
+them — which, as far as the token goes, is true.
+
+`aud` is the only field that tells the two servers apart. It is the issuer's
+record of who the token was for, written at the moment the user consented, and
+checking it is the whole distance between *this token is genuine* and *this
+token is mine*. Signature, issuer and expiry answer the first question. None of
+them touches the second.
+
+A token from somewhere else does not need an attacker to arrive, either. A
+client pointed at the wrong endpoint sends one by accident. An issuer configured
+to mint one token for a whole estate sends one to everything. And a server that
+was handed a token and passes it to its own next hop sends one deliberately —
+which is why the guard takes the token off the request before the tool sees it.
+
+### Where the metadata endpoint comes in
+
+Refusing tokens minted elsewhere is only half a working system. The other half
+is telling a client how to obtain one that was minted here, and that is what the
+RFC 9728 metadata document is for. The loop is three steps: the `401` carries
+`resource_metadata`, the document at that URL names this server's `resource`
+identifier and the authorization servers it trusts, and the client asks one of
+those for a token *for that resource* — RFC 8707's `resource` parameter, which is
+what makes the issuer write this server's identifier into `aud`. Skip discovery
+and a strict server is simply an unreachable one: it refuses every token it is
+offered, and the only remedy is configuring each client by hand.
+
+So the two halves are one mechanism, not two features. The `resource` in the
+published document and the resource the verifier binds tokens to have to be the
+same string, and the guard refuses to serve when they are not.
+
 ## Discovery
 
 `Mount` puts the document at the URL the `401` advertises, and RFC 9728 §3.1 is
