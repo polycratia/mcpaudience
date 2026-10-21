@@ -12,7 +12,7 @@ unrelated service — and hand that service's user everything this one can do.
 $ go run ./example
 --- no token ---
 status: 401
-WWW-Authenticate: Bearer, error_description="no bearer token presented", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"
 
 --- token issued for another service ---
 status: 401
@@ -300,7 +300,9 @@ browser history.
 
 `401` means "I do not know who you are" and carries `WWW-Authenticate` with
 `resource_metadata`, so a client can discover where to get a token instead of
-being configured by hand.
+being configured by hand. The first one — the request that carried no token at
+all — says only that: the `Bearer` scheme, where the document is, and the scopes
+the guard will require, with no error code on it, because nothing failed yet.
 
 `403` means "I know who you are and this is not yours". Missing scope answers
 `403`, never `401`: sending a client off to fetch another token would only get

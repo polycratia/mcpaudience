@@ -107,7 +107,7 @@ func RequireTool(name string, next http.Handler, scopes ...string) http.Handler 
 			tool = r.URL.Path
 		}
 		if missing := principal.Missing(scopes...); len(missing) > 0 {
-			writeChallenge(w, "", &ScopeError{
+			writeChallenge(w, "", nil, &ScopeError{
 				Tool:     tool,
 				Required: scopes,
 				Missing:  missing,
@@ -135,13 +135,13 @@ func BearerToken(r *http.Request) (string, error) {
 }
 
 func (g *Guard) challenge(w http.ResponseWriter, err error) {
-	writeChallenge(w, g.Metadata.URL(), err)
+	writeChallenge(w, g.Metadata.URL(), g.RequiredScopes, err)
 }
 
 // writeChallenge answers 401 with the WWW-Authenticate header that tells a
 // client where to get a token — the discovery step RFC 9728 adds, and the
 // reason a client does not have to be configured with an issuer in advance.
-func writeChallenge(w http.ResponseWriter, metadataURL string, err error) {
+func writeChallenge(w http.ResponseWriter, metadataURL string, requiredScopes []string, err error) {
 	if errors.Is(err, ErrNoResource) {
 		// The server cannot name itself, so it cannot tell a token meant for it
 		// from one that is not. That is this server's fault, not the client's.
@@ -149,13 +149,16 @@ func writeChallenge(w http.ResponseWriter, metadataURL string, err error) {
 		return
 	}
 
+	if errors.Is(err, ErrNoToken) {
+		w.Header().Set("WWW-Authenticate", firstChallenge(metadataURL, requiredScopes))
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	code := http.StatusUnauthorized
 	parts := []string{`Bearer error="invalid_token"`}
 
-	switch {
-	case errors.Is(err, ErrNoToken):
-		parts = []string{"Bearer"}
-	case errors.Is(err, ErrMissingScope):
+	if errors.Is(err, ErrMissingScope) {
 		// RFC 6750: not being allowed is 403, not 401. Answering 401 would send
 		// a client off to fetch another token that would have the same scopes.
 		code = http.StatusForbidden
@@ -174,4 +177,29 @@ func writeChallenge(w http.ResponseWriter, metadataURL string, err error) {
 
 	w.Header().Set("WWW-Authenticate", strings.Join(parts, ", "))
 	http.Error(w, err.Error(), code)
+}
+
+// firstChallenge is the header a request carrying no credential at all gets.
+//
+// It says less than the others on purpose. RFC 6750 §3.1 asks a server not to
+// return an error code when the request had no authentication information in
+// it: nothing failed, the client simply has not been told where to go yet. And
+// under the auth-param grammar of RFC 9110 §11.3 a comma straight after the
+// scheme ends the challenge, so `Bearer, resource_metadata="…"` hands the
+// client a bare Bearer challenge followed by parameters belonging to nothing.
+//
+// What is left is the scheme, the document that says where a token comes from,
+// and the scopes this server will require — the initial guidance the MCP
+// authorization specification asks for under Scope Selection Strategy
+// (revision 2026-07-28), so the client's first token request can be the right
+// one rather than the one that comes back short.
+func firstChallenge(metadataURL string, requiredScopes []string) string {
+	if metadataURL == "" {
+		return "Bearer"
+	}
+	challenge := fmt.Sprintf("Bearer resource_metadata=%q", metadataURL)
+	if len(requiredScopes) > 0 {
+		challenge += fmt.Sprintf(", scope=%q", strings.Join(requiredScopes, " "))
+	}
+	return challenge
 }

@@ -62,6 +62,43 @@ func TestUnauthenticatedRequestIsPointedAtTheMetadata(t *testing.T) {
 	}
 }
 
+// The first 401 is the one a client gets before it has a token at all. Nothing
+// failed, so it carries no error code, and the parameters have to hang off the
+// Bearer scheme rather than off a comma that ended it.
+func TestTheFirstChallengeIsAWellFormedBearerChallenge(t *testing.T) {
+	pointer := `Bearer resource_metadata="` + resource + MetadataPath + `"`
+
+	bare := call(guard(stubVerifier{err: ErrNoToken}), okHandler(), "")
+	if got := bare.Header().Get("WWW-Authenticate"); got != pointer {
+		t.Errorf("challenge = %q, want %q", got, pointer)
+	}
+	if body := bare.Body.String(); !strings.Contains(body, ErrNoToken.Error()) {
+		t.Errorf("body = %q, want it to say no token was presented", body)
+	}
+
+	// A client that has to guess its scopes asks for the wrong ones once.
+	scoped := call(guard(stubVerifier{err: ErrNoToken}, "files:read", "files:delete"), okHandler(), "")
+	want := pointer + `, scope="files:read files:delete"`
+	if got := scoped.Header().Get("WWW-Authenticate"); got != want {
+		t.Errorf("challenge = %q, want %q", got, want)
+	}
+
+	v := stubVerifier{claims: Claims{Subject: "user-1", Scope: "files:read", Active: true}}
+	responses := map[string]*httptest.ResponseRecorder{
+		"no token":           bare,
+		"no token, scoped":   scoped,
+		"invalid token":      call(guard(stubVerifier{err: ErrMalformedToken}), okHandler(), "Bearer abc"),
+		"server-wide scope":  call(guard(v, "files:delete"), okHandler(), "Bearer abc"),
+		"per-tool scope":     callPath(guard(v), Require(okHandler(), "files:delete"), "/tools/delete", "Bearer abc"),
+	}
+	for name, response := range responses {
+		challenge := response.Header().Get("WWW-Authenticate")
+		if strings.HasPrefix(challenge, "Bearer,") {
+			t.Errorf("%s: challenge = %q: the comma ends the scheme, detaching every parameter from it", name, challenge)
+		}
+	}
+}
+
 func TestAValidTokenReachesTheHandler(t *testing.T) {
 	v := stubVerifier{claims: Claims{Subject: "user-1", Scope: "mcp:read", Active: true}}
 	response := call(guard(v), okHandler(), "Bearer abc")
