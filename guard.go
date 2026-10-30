@@ -19,6 +19,11 @@ type Guard struct {
 	RequiredScopes []string
 }
 
+// retryAfter is what a client is told to wait when the issuer's keys could not
+// be reached: long enough that a fleet of clients does not turn the outage into
+// a retry storm, short enough to be a pause rather than a refusal.
+const retryAfter = "30"
+
 // Handler wraps next so that only requests with a token for this resource
 // reach it, and so that what reaches it is the principal rather than the token.
 func (g *Guard) Handler(next http.Handler) http.Handler {
@@ -141,11 +146,24 @@ func (g *Guard) challenge(w http.ResponseWriter, err error) {
 // writeChallenge answers 401 with the WWW-Authenticate header that tells a
 // client where to get a token — the discovery step RFC 9728 adds, and the
 // reason a client does not have to be configured with an issuer in advance.
+//
+// Two failures carry no challenge at all, because neither is about the
+// credential: a server that cannot name itself, and a server that could not
+// reach the keys it would have verified against.
 func writeChallenge(w http.ResponseWriter, metadataURL string, requiredScopes []string, err error) {
 	if errors.Is(err, ErrNoResource) {
 		// The server cannot name itself, so it cannot tell a token meant for it
 		// from one that is not. That is this server's fault, not the client's.
 		http.Error(w, "mcpaudience: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if errors.Is(err, ErrUnavailable) {
+		// No verdict was reached, so there is nothing to challenge: the token may
+		// well be fine. A 401 invalid_token would send the client to its issuer
+		// for a replacement that fails the same way until the keys come back.
+		w.Header().Set("Retry-After", retryAfter)
+		http.Error(w, "mcpaudience: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 

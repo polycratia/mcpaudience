@@ -149,6 +149,13 @@ var (
 // 401 would blame the client for a mistake it cannot fix.
 var ErrNoResource = errors.New("no resource identifier configured: audience binding cannot be skipped")
 
+// ErrUnavailable is the absence of a verdict rather than a refusal: the keys a
+// token would be verified against are not held and the issuer could not be
+// reached, so nothing is known about the signature either way. It answers 503,
+// because a client told invalid_token goes and fetches another token that fails
+// the same way for as long as the outage lasts.
+var ErrUnavailable = errors.New("the authorization server's keys cannot be reached, so the token cannot be verified")
+
 // ScopeError is a denial a caller can act on. A bare 403 says only that the
 // request lost, which leaves four guesses on the table: wrong token, wrong
 // tool, wrong user, or a server bug. This one names the tool that refused, the

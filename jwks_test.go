@@ -178,8 +178,64 @@ func TestTheLastGoodKeySetSurvivesAnIssuerOutage(t *testing.T) {
 	}
 }
 
+// A cold cache has no last good set to fall back on, and that is not a verdict
+// on the token: the signature was never checked. A 401 invalid_token would send
+// the client to its issuer for a replacement that fails the same way, so the
+// honest answer is 503 and an interval to wait.
+func TestAnUnreachableIssuerOnAColdCacheIsNotTheTokensFault(t *testing.T) {
+	s := newSigner(t)
+	issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
+	issuer.fail(http.StatusBadGateway)
+
+	v := keySetVerifier(&JWKS{URL: issuer.url, Now: func() time.Time { return now }})
+	token := s.sign(t, "RS256", "rsa-1", goodClaims())
+
+	_, err := v.Verify(context.Background(), token)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if errors.Is(err, ErrBadSignature) {
+		t.Errorf("err = %v, want a failed fetch not to read as a bad signature", err)
+	}
+
+	response := call(guard(v), okHandler(), "Bearer "+token)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", response.Code)
+	}
+	if response.Header().Get("Retry-After") == "" {
+		t.Error("a 503 with no Retry-After leaves the client to invent an interval")
+	}
+	if challenge := response.Header().Get("WWW-Authenticate"); challenge != "" {
+		t.Errorf("challenge = %q, want none: nothing is known to be wrong with the credential", challenge)
+	}
+}
+
+// The other side of that line. The issuer answered, the set it published does
+// not name this key id, and that is a refusal rather than an outage: retrying
+// buys the client nothing, a different token might.
+func TestAKeyIDMissingFromAFreshKeySetIsStillAnInvalidToken(t *testing.T) {
+	s := newSigner(t)
+	issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
+	v := keySetVerifier(&JWKS{URL: issuer.url, Now: func() time.Time { return now }})
+	token := s.sign(t, "RS256", "rsa-9", goodClaims())
+
+	_, err := v.Verify(context.Background(), token)
+	if !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("err = %v, want ErrBadSignature", err)
+	}
+	if errors.Is(err, ErrUnavailable) {
+		t.Errorf("err = %v, want a key id nobody published not to read as an outage", err)
+	}
+
+	response := call(guard(v), okHandler(), "Bearer "+token)
+	if response.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", response.Code)
+	}
+}
+
 // A symmetric key in a set of public keys is the algorithm-confusion attack
-// with the secret handed over in advance.
+// with the secret handed over in advance. Nothing usable is left in the set, so
+// there is no verdict to give either — only the reason it could not be reached.
 func TestASymmetricKeyInThePublishedSetIsRefused(t *testing.T) {
 	secret := []byte("a shared secret that has no business being published")
 	issuer := newKeyServer(t, map[string]any{
@@ -194,8 +250,8 @@ func TestASymmetricKeyInThePublishedSetIsRefused(t *testing.T) {
 	forged := signed + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 
 	_, err := v.Verify(context.Background(), forged)
-	if !errors.Is(err, ErrBadSignature) {
-		t.Fatalf("err = %v, want ErrBadSignature", err)
+	if err == nil {
+		t.Fatal("a token signed with a published symmetric key was accepted")
 	}
 	if !strings.Contains(err.Error(), "symmetric") {
 		t.Errorf("the refusal does not say what was wrong with the key: %v", err)

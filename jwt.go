@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -117,6 +118,12 @@ func (v *JWTVerifier) key(ctx context.Context, kid string) (crypto.PublicKey, er
 	}
 	key, err := v.KeySet.Key(ctx, kid)
 	if err != nil {
+		if errors.Is(err, ErrUnavailable) {
+			// The key set was never reached, so the signature was never checked.
+			// Folding this into ErrBadSignature would tell the client its token
+			// is bad, and it would spend the outage fetching replacements.
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: %v", ErrBadSignature, err)
 	}
 	return key, nil

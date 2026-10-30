@@ -59,6 +59,10 @@ const maxKeySetBytes = 1 << 20
 
 // Key returns the public key published under kid, fetching the set if it is not
 // held, has gone stale, or does not name that key id yet.
+//
+// A fetch that fails with no copy of the set in memory is ErrUnavailable rather
+// than an unknown key: the issuer was never reached, so nothing has been
+// learned about the token that named this key id.
 func (j *JWKS) Key(ctx context.Context, kid string) (crypto.PublicKey, error) {
 	if err := j.checkURL(); err != nil {
 		return nil, err
@@ -79,6 +83,11 @@ func (j *JWKS) Key(ctx context.Context, kid string) (crypto.PublicKey, error) {
 			// published stopped being its key. Tokens still expire on their own.
 			return cached, nil
 		}
+		if len(j.keys) == 0 {
+			return nil, fmt.Errorf("%w: no key set from %s is held: %v", ErrUnavailable, j.URL, err)
+		}
+		// A set is held and does not name this kid, which is a verdict rather
+		// than an outage, whatever the failed refresh was about.
 		return nil, fmt.Errorf("no key for kid %q: %v", kid, err)
 	}
 	if key, ok := j.keys[kid]; ok {
