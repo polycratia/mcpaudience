@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -198,6 +199,79 @@ func TestParallelVerifiesOnAnUnknownKeyIDFetchTheKeySetOnce(t *testing.T) {
 	}
 	if got := issuer.count(); got != 1 {
 		t.Errorf("the issuer was asked %d times by %d parallel verifies naming a key id it never published, want once", got, callers)
+	}
+}
+
+// What the schedule is for, with the request path kept in the state that makes
+// it necessary. A floor busy with invented key ids spends MinRefresh and brings
+// the copy in memory no further forward: the first token fetches, every one
+// after it is declined, and there is no fetch left on the request path to meet a
+// rotation with. The issuer publishes rsa-2 ahead of using it, a tick fetches it
+// — the interval does not hold a scheduled fetch off — and the first token ever
+// to name rsa-2 passes on first try, from the copy that tick brought back,
+// rather than after the interval lapses or a retry.
+func TestAScheduledTickMeetsARotationTheBusyRequestPathCannot(t *testing.T) {
+	old, rotated := newSigner(t), newSigner(t)
+	issuer := newKeyServer(t, rsaJWK("rsa-1", &old.rsaKey.PublicKey))
+
+	clock := now
+	set := &JWKS{
+		URL:        issuer.url,
+		CacheFor:   time.Hour,
+		MinRefresh: time.Hour,
+		Now:        func() time.Time { return clock },
+	}
+	v := keySetVerifier(set)
+
+	// The floor. The first of these fetches the set; the rest are refused from
+	// the copy it brought back.
+	invented := func(from, to int) {
+		t.Helper()
+		for i := from; i < to; i++ {
+			clock = now.Add(time.Duration(i) * time.Second)
+			_, err := v.Verify(context.Background(), old.sign(t, "RS256", fmt.Sprintf("invented-%d", i), goodClaims()))
+			if !errors.Is(err, ErrBadSignature) {
+				t.Fatalf("err = %v, want ErrBadSignature for a key id nobody published", err)
+			}
+		}
+	}
+	invented(0, 6)
+	if got := issuer.count(); got != 1 {
+		t.Fatalf("the issuer was asked %d times by a floor of invented key ids, want once", got)
+	}
+
+	// Rotation, published before anything is signed with it.
+	issuer.publish(rsaJWK("rsa-1", &old.rsaKey.PublicKey), rsaJWK("rsa-2", &rotated.rsaKey.PublicKey))
+
+	// The floor goes on, and goes on being declined, so nothing on the request
+	// path notices the new key.
+	invented(6, 12)
+	if got := issuer.count(); got != 1 {
+		t.Fatalf("the issuer was asked %d times inside the interval, want the floor to have spent it once", got)
+	}
+
+	// The tick, driven here rather than waited for: this is the fetch Start makes
+	// once a period, and the interval has nothing to say about it.
+	clock = now.Add(time.Minute)
+	if err := set.Refresh(context.Background()); err != nil {
+		t.Fatalf("the scheduled fetch was declined by the interval the floor spent: %v", err)
+	}
+	if got := issuer.count(); got != 2 {
+		t.Fatalf("the issuer was asked %d times, want the tick to have fetched the rotated set", got)
+	}
+
+	// The first token anyone has presented on the rotated key id, well inside the
+	// interval the floor and the tick have both spent.
+	clock = now.Add(time.Minute + time.Second)
+	claims, err := v.Verify(context.Background(), rotated.sign(t, "RS256", "rsa-2", goodClaims()))
+	if err != nil {
+		t.Fatalf("the first token naming the rotated key id was refused with that key already held: %v", err)
+	}
+	if claims.Subject != "user-1" {
+		t.Errorf("claims = %+v", claims)
+	}
+	if got := issuer.count(); got != 2 {
+		t.Errorf("the issuer was asked %d times, want the token answered from the copy the tick brought back", got)
 	}
 }
 
