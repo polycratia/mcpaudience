@@ -154,6 +154,65 @@ func TestAnUnknownKeyIDIsNotAFetchPerToken(t *testing.T) {
 	}
 }
 
+// The interval is spent by the attempt, not by its result: the attempt is
+// recorded before the fetch is made, so a failed one and an abandoned one hold
+// the next fetch off for just as long as a successful one. That is the case the
+// interval exists for — an issuer that is down is where refetching on every
+// arriving token does the most damage — and the cost is that recovery waits for
+// the interval to lapse rather than for the next request.
+func TestAFailedOrAbandonedFetchStillSpendsTheRefreshInterval(t *testing.T) {
+	s := newSigner(t)
+	issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
+	issuer.fail(http.StatusInternalServerError)
+
+	clock := now
+	set := &JWKS{URL: issuer.url, MinRefresh: time.Minute, Now: func() time.Time { return clock }}
+
+	if _, err := set.Key(context.Background(), "rsa-1"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if got := issuer.count(); got != 1 {
+		t.Fatalf("the issuer was asked %d times for the first fetch, want once", got)
+	}
+
+	clock = now.Add(30 * time.Second)
+	if _, err := set.Key(context.Background(), "rsa-1"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if got := issuer.count(); got != 1 {
+		t.Errorf("the issuer was asked %d times inside the interval after a fetch that failed, want once", got)
+	}
+
+	// The issuer is answering again and the interval has lapsed, but this
+	// request is abandoned before the fetch can finish. The attempt was still
+	// recorded, so it spends the interval like any other.
+	issuer.fail(http.StatusOK)
+	clock = now.Add(time.Minute)
+	abandoned, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := set.Key(abandoned, "rsa-1"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	spent := issuer.count()
+
+	clock = now.Add(90 * time.Second)
+	if _, err := set.Key(context.Background(), "rsa-1"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want the abandoned attempt to have spent the interval", err)
+	}
+	if got := issuer.count(); got != spent {
+		t.Errorf("the issuer was asked again inside the interval an abandoned attempt spent: %d requests, want %d", got, spent)
+	}
+
+	// And when the interval lapses again, the fetch happens.
+	clock = now.Add(2 * time.Minute)
+	if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+		t.Errorf("the key was not fetched once the interval lapsed: %v", err)
+	}
+	if got := issuer.count(); got != spent+1 {
+		t.Errorf("the issuer was asked %d times in total, want %d once the interval lapsed", got, spent+1)
+	}
+}
+
 // An issuer being unreachable is not evidence that the key it published stopped
 // being its key, and the tokens it signed expire on their own.
 func TestTheLastGoodKeySetSurvivesAnIssuerOutage(t *testing.T) {

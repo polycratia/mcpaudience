@@ -46,6 +46,16 @@ type JWKS struct {
 	CacheFor time.Duration
 	// MinRefresh is the shortest gap between two fetches, whatever asks for one.
 	// Defaults to 30 seconds.
+	//
+	// The interval is spent by the attempt rather than by its result: it is
+	// recorded before the request goes out, so a fetch that failed — or one
+	// abandoned because the request whose token triggered it was cancelled —
+	// holds the next one off for the full interval, exactly as a fetch that
+	// succeeded does. That is the case the interval exists for: an issuer that
+	// is down or slow is where refetching on every arriving token does the most
+	// damage. The cost is that recovery is not immediate — the last good set
+	// keeps answering until the interval lapses, and a cache that never held one
+	// answers ErrUnavailable until then.
 	MinRefresh time.Duration
 	// OnRefresh, if set, is called once for every fetch of the key set that
 	// actually happens: not for a key answered from memory, and not for one
@@ -145,6 +155,8 @@ func (j *JWKS) refresh(ctx context.Context, kid string) (*KeySetRefresh, error) 
 		return nil, fmt.Errorf("the key set was fetched %s ago and is not fetched again more than once every %s",
 			since.Round(time.Second), j.minRefresh())
 	}
+	// Recorded before the fetch rather than after it, so an attempt that fails
+	// or is abandoned spends the interval too.
 	j.attempted = now
 	fetch := &KeySetRefresh{KeyID: kid, At: now}
 
