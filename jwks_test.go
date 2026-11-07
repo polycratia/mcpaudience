@@ -330,6 +330,82 @@ func TestMaxStaleIsMeasuredFromTheLastSuccessfulFetch(t *testing.T) {
 	}
 }
 
+// Token expiry is not the same bound, and an outage that outlasts MaxStale is
+// where the two come apart. The tokens the cached key had already signed do
+// expire on their own, but the issuer goes on minting fresh ones on that same
+// kid for as long as the outage lasts, and those arrive with an hour left on
+// them. So the question the cache answers is not whether this token is still
+// live — it plainly is — but whether the key it names is still the issuer's,
+// and past the bound nobody here can say. The refusal is the outage: a 503 and
+// an interval, not a verdict on a credential minted a moment ago.
+func TestAFreshTokenOnACachedKeyIDIsRefusedWhenTheOutageOutlastsMaxStale(t *testing.T) {
+	s := newSigner(t)
+	issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
+
+	clock := now
+	set := &JWKS{
+		URL:        issuer.url,
+		CacheFor:   time.Minute,
+		MinRefresh: time.Second,
+		MaxStale:   10 * time.Minute,
+		Now:        func() time.Time { return clock },
+	}
+	v := &JWTVerifier{
+		Resource: resource,
+		Issuers:  []string{"https://auth.example.com"},
+		KeySet:   set,
+		Now:      func() time.Time { return clock },
+	}
+
+	// A token the issuer signs on the cached kid at whatever the clock says now,
+	// so nothing about it has aged by the time it is presented.
+	minted := func() string {
+		claims := goodClaims()
+		claims["iat"] = clock.Unix()
+		claims["exp"] = clock.Add(time.Hour).Unix()
+		return s.sign(t, "RS256", "rsa-1", claims)
+	}
+
+	if _, err := v.Verify(context.Background(), minted()); err != nil {
+		t.Fatal(err)
+	}
+
+	issuer.fail(http.StatusInternalServerError)
+
+	clock = now.Add(9 * time.Minute)
+	if _, err := v.Verify(context.Background(), minted()); err != nil {
+		t.Errorf("a token minted during the outage was refused inside MaxStale: %v", err)
+	}
+
+	clock = now.Add(11 * time.Minute)
+	fresh := minted()
+	_, err := v.Verify(context.Background(), fresh)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable: the copy in memory outlived the bound", err)
+	}
+	if errors.Is(err, ErrExpired) || errors.Is(err, ErrBadSignature) {
+		t.Errorf("err = %v, want the outage rather than a verdict on a token minted a moment ago", err)
+	}
+
+	response := call(guard(v), okHandler(), "Bearer "+fresh)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", response.Code)
+	}
+	if response.Header().Get("Retry-After") == "" {
+		t.Error("a 503 with no Retry-After leaves the client to invent an interval")
+	}
+	if challenge := response.Header().Get("WWW-Authenticate"); challenge != "" {
+		t.Errorf("challenge = %q, want none: the signature was never checked against anything current", challenge)
+	}
+
+	// Unset, there is no bound, and that is the trade the other way: the same
+	// fresh token keeps being verified against a copy nobody can confirm.
+	set.MaxStale = 0
+	if _, err := v.Verify(context.Background(), fresh); err != nil {
+		t.Errorf("without MaxStale the last good set should go on answering: %v", err)
+	}
+}
+
 // A cold cache has no last good set to fall back on, and that is not a verdict
 // on the token: the signature was never checked. A 401 invalid_token would send
 // the client to its issuer for a replacement that fails the same way, so the
