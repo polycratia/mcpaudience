@@ -246,6 +246,15 @@ When the issuer cannot be reached, the last good set keeps answering. An issuer
 being down is not evidence that the key it published stopped being its key, and
 the tokens it signed expire on their own.
 
+`OnRefresh` is how that gets watched from outside: it is called once for every
+fetch that actually happens — not for a key answered from memory, not for one
+`MinRefresh` declined to make — with the `kid` that triggered it, the key ids the
+set came back with, and the error if it failed. It runs on the goroutine of the
+request whose token triggered the fetch, after `Key` has released the lock held
+across that fetch, and it is handed no context: the caller's belongs to a
+request about to be answered, so anything the callback sends elsewhere needs a
+context and a deadline of its own.
+
 Two refusals happen at fetch time rather than verify time. A key set URL that is
 not `https` is refused before the first request, because a key set an attacker
 on the path can replace is a key set that verifies the attacker's tokens. And a

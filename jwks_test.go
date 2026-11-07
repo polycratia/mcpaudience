@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -288,6 +289,99 @@ func TestAKeySetWithNothingUsableInItIsAnError(t *testing.T) {
 
 	if _, err := set.Key(context.Background(), "rsa-1"); err == nil {
 		t.Error("a key set with nothing usable in it was accepted as empty")
+	}
+}
+
+// OnRefresh is a place to watch rotation from, not a worker, and where it runs
+// is what decides that: on the goroutine of the request whose token triggered
+// the fetch, after Key has let go of the lock the fetch was made under — so a
+// callback that reads the cache it was just told about does not deadlock — and
+// with no context of its own.
+func TestTheRefreshCallbackRunsOnTheTriggeringRequestAfterTheLockIsReleased(t *testing.T) {
+	s := newSigner(t)
+	issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
+
+	var (
+		observed  []KeySetRefresh
+		stack     string
+		reentered bool
+		reentry   error
+	)
+	set := &JWKS{URL: issuer.url, Now: func() time.Time { return now }}
+	set.OnRefresh = func(r KeySetRefresh) {
+		observed = append(observed, r)
+		buffer := make([]byte, 8192)
+		stack = string(buffer[:runtime.Stack(buffer, false)])
+		if !reentered {
+			reentered = true
+			_, reentry = set.Key(context.Background(), "rsa-1")
+		}
+	}
+
+	// A callback running under j.mu would leave that reentrant Key waiting for a
+	// lock its own caller still holds, so the wait here is the assertion.
+	done := make(chan error, 1)
+	go func() {
+		_, err := set.Key(context.Background(), "rsa-1")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Key never returned: the callback is running while j.mu is still held")
+	}
+	if reentry != nil {
+		t.Errorf("the callback could not read the cache it was told about: %v", reentry)
+	}
+
+	if len(observed) != 1 {
+		t.Fatalf("observed %d fetches, want the one that happened", len(observed))
+	}
+	fetch := observed[0]
+	if fetch.KeyID != "rsa-1" || fetch.Err != nil || len(fetch.KeyIDs) != 1 || fetch.KeyIDs[0] != "rsa-1" {
+		t.Errorf("fetch = %+v, want the triggering kid and the set it came back with", fetch)
+	}
+	if !fetch.At.Equal(now) {
+		t.Errorf("At = %v, want the cache's clock", fetch.At)
+	}
+	if !strings.Contains(stack, "(*JWKS).Key") ||
+		!strings.Contains(stack, "TestTheRefreshCallbackRunsOnTheTriggeringRequest") {
+		t.Errorf("the callback is not on the caller's goroutine inside Key:\n%s", stack)
+	}
+
+	// A key answered from memory is not a fetch, so there is nothing to report.
+	if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(observed) != 1 {
+		t.Errorf("observed %d fetches, want a cache hit to report none", len(observed))
+	}
+}
+
+// A fetch that failed is the one worth watching, so it is reported rather than
+// swallowed: the error is there, and no key ids are claimed.
+func TestTheRefreshCallbackReportsAFetchThatFailed(t *testing.T) {
+	issuer := newKeyServer(t)
+	issuer.fail(http.StatusBadGateway)
+
+	var observed []KeySetRefresh
+	set := &JWKS{
+		URL:       issuer.url,
+		Now:       func() time.Time { return now },
+		OnRefresh: func(r KeySetRefresh) { observed = append(observed, r) },
+	}
+
+	if _, err := set.Key(context.Background(), "rsa-1"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("observed %d fetches, want the one that failed", len(observed))
+	}
+	if observed[0].Err == nil || len(observed[0].KeyIDs) != 0 {
+		t.Errorf("fetch = %+v, want the error and no key ids", observed[0])
 	}
 }
 

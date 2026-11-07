@@ -11,10 +11,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"math/big"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +47,19 @@ type JWKS struct {
 	// MinRefresh is the shortest gap between two fetches, whatever asks for one.
 	// Defaults to 30 seconds.
 	MinRefresh time.Duration
+	// OnRefresh, if set, is called once for every fetch of the key set that
+	// actually happens: not for a key answered from memory, and not for one
+	// MinRefresh declined to make.
+	//
+	// Where it runs is what decides what belongs in it. It runs on the
+	// goroutine of the request whose token triggered the fetch, so whatever it
+	// does is part of that request's latency. It runs after Key has released
+	// j.mu, the lock held across the fetch, so it can read this cache without
+	// deadlocking and a slow callback does not hold back the requests queued
+	// behind a rotation. And it is handed no context: the caller's belongs to a
+	// request that is about to be answered, so anything the callback sends
+	// elsewhere needs a context and a deadline of its own.
+	OnRefresh func(KeySetRefresh)
 	// Now is injectable for tests.
 	Now func() time.Time
 
@@ -53,6 +68,20 @@ type JWKS struct {
 	skipped   map[string]string
 	fetched   time.Time
 	attempted time.Time
+}
+
+// KeySetRefresh is one fetch of the key set, as reported to OnRefresh.
+type KeySetRefresh struct {
+	// KeyID is the key id whose absence or staleness triggered the fetch.
+	KeyID string
+	// KeyIDs are the usable key ids the fetched set carried, sorted. It is
+	// empty when the fetch produced no set.
+	KeyIDs []string
+	// At is when the fetch was made, on this cache's clock.
+	At time.Time
+	// Err is why the fetch produced no new set. It is not a verdict on the
+	// token that triggered it: the last good set keeps answering.
+	Err error
 }
 
 const maxKeySetBytes = 1 << 20
@@ -68,6 +97,16 @@ func (j *JWKS) Key(ctx context.Context, kid string) (crypto.PublicKey, error) {
 		return nil, err
 	}
 
+	key, fetch, err := j.key(ctx, kid)
+	if fetch != nil && j.OnRefresh != nil {
+		j.OnRefresh(*fetch)
+	}
+	return key, err
+}
+
+// key does the lookup and hands back the fetch it made, if it made one, for the
+// caller to report once the lock is gone.
+func (j *JWKS) key(ctx context.Context, kid string) (crypto.PublicKey, *KeySetRefresh, error) {
 	// The lock is held across the fetch, so a burst of requests arriving on a
 	// rotation makes one request at the issuer rather than one each.
 	j.mu.Lock()
@@ -75,48 +114,54 @@ func (j *JWKS) Key(ctx context.Context, kid string) (crypto.PublicKey, error) {
 
 	cached, known := j.keys[kid]
 	if known && !j.stale() {
-		return cached, nil
+		return cached, nil, nil
 	}
-	if err := j.refresh(ctx); err != nil {
+	fetch, err := j.refresh(ctx, kid)
+	if err != nil {
 		if known {
 			// An issuer being unreachable is not evidence that the key it
 			// published stopped being its key. Tokens still expire on their own.
-			return cached, nil
+			return cached, fetch, nil
 		}
 		if len(j.keys) == 0 {
-			return nil, fmt.Errorf("%w: no key set from %s is held: %v", ErrUnavailable, j.URL, err)
+			return nil, fetch, fmt.Errorf("%w: no key set from %s is held: %v", ErrUnavailable, j.URL, err)
 		}
 		// A set is held and does not name this kid, which is a verdict rather
 		// than an outage, whatever the failed refresh was about.
-		return nil, fmt.Errorf("no key for kid %q: %v", kid, err)
+		return nil, fetch, fmt.Errorf("no key for kid %q: %v", kid, err)
 	}
 	if key, ok := j.keys[kid]; ok {
-		return key, nil
+		return key, fetch, nil
 	}
 	if reason, ok := j.skipped[kid]; ok {
-		return nil, fmt.Errorf("the key set lists kid %q but it cannot be used: %s", kid, reason)
+		return nil, fetch, fmt.Errorf("the key set lists kid %q but it cannot be used: %s", kid, reason)
 	}
-	return nil, fmt.Errorf("no key for kid %q in the key set at %s", kid, j.URL)
+	return nil, fetch, fmt.Errorf("no key for kid %q in the key set at %s", kid, j.URL)
 }
 
-func (j *JWKS) refresh(ctx context.Context) error {
+func (j *JWKS) refresh(ctx context.Context, kid string) (*KeySetRefresh, error) {
 	now := j.now()
 	if since := now.Sub(j.attempted); !j.attempted.IsZero() && since < j.minRefresh() {
-		return fmt.Errorf("the key set was fetched %s ago and is not fetched again more than once every %s",
+		return nil, fmt.Errorf("the key set was fetched %s ago and is not fetched again more than once every %s",
 			since.Round(time.Second), j.minRefresh())
 	}
 	j.attempted = now
+	fetch := &KeySetRefresh{KeyID: kid, At: now}
 
 	body, err := j.get(ctx)
 	if err != nil {
-		return err
+		fetch.Err = err
+		return fetch, err
 	}
 	keys, skipped, err := parseKeySet(body)
 	if err != nil {
-		return fmt.Errorf("%s: %v", j.URL, err)
+		err = fmt.Errorf("%s: %v", j.URL, err)
+		fetch.Err = err
+		return fetch, err
 	}
 	j.keys, j.skipped, j.fetched = keys, skipped, now
-	return nil
+	fetch.KeyIDs = slices.Sorted(maps.Keys(keys))
+	return fetch, nil
 }
 
 func (j *JWKS) get(ctx context.Context) ([]byte, error) {
