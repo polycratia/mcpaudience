@@ -121,7 +121,9 @@ func (v *JWTVerifier) key(ctx context.Context, kid string) (crypto.PublicKey, er
 		if errors.Is(err, ErrUnavailable) {
 			// The key set was never reached, so the signature was never checked.
 			// Folding this into ErrBadSignature would tell the client its token
-			// is bad, and it would spend the outage fetching replacements.
+			// is bad, and it would spend the outage fetching replacements. The
+			// failure travels on unwrapped, so the 503 can still read the retry
+			// interval the cache attached to it.
 			return nil, err
 		}
 		return nil, fmt.Errorf("%w: %v", ErrBadSignature, err)

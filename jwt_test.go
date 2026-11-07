@@ -238,3 +238,37 @@ func TestMalformedTokens(t *testing.T) {
 		})
 	}
 }
+
+// failingKeySource is a key source that only fails, with whatever failure the
+// test wants the verifier to meet.
+type failingKeySource struct{ err error }
+
+func (f failingKeySource) Key(context.Context, string) (crypto.PublicKey, error) {
+	return nil, f.err
+}
+
+// An unreachable key set is the absence of a verdict, and it has to reach the
+// guard as one: wrapping it in ErrBadSignature would turn a 503 into a 401,
+// tell a client its token is bad when nothing has been checked, and lose the
+// retry interval the cache attached to the failure on the way.
+func TestAnUnreachableKeySetIsNotReportedAsABadSignature(t *testing.T) {
+	s := newSigner(t)
+	failure := outage{wait: 12 * time.Second}
+
+	v := verifier(s)
+	v.Keys = nil
+	v.KeySet = failingKeySource{err: failure}
+
+	_, err := v.Verify(context.Background(), s.sign(t, "RS256", "rsa-1", goodClaims()))
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if errors.Is(err, ErrBadSignature) {
+		t.Errorf("err = %v, want nothing about the signature: it was never checked", err)
+	}
+
+	var waiter retryWaiter
+	if !errors.As(err, &waiter) || waiter.RetryAfter() != failure.wait {
+		t.Errorf("err = %v, want it to carry the %s the cache is holding", err, failure.wait)
+	}
+}
