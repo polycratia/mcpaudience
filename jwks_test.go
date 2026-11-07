@@ -239,8 +239,9 @@ func TestTheLastGoodKeySetSurvivesAnIssuerOutage(t *testing.T) {
 }
 
 // MaxStale is the other reading of the same outage: a copy of the set that can
-// no longer be confirmed stops answering once it is that far past its refresh,
-// and what it answers then is the outage rather than a verdict on the token.
+// no longer be confirmed stops answering once it is that far past the fetch
+// that produced it, and what it answers then is the outage rather than a
+// verdict on the token.
 func TestMaxStaleBoundsHowLongTheLastGoodKeySetAnswers(t *testing.T) {
 	s := newSigner(t)
 	issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
@@ -267,7 +268,7 @@ func TestMaxStaleBoundsHowLongTheLastGoodKeySetAnswers(t *testing.T) {
 	clock = now.Add(12 * time.Minute)
 	_, err := set.Key(context.Background(), "rsa-1")
 	if !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("err = %v, want ErrUnavailable once the set is older than CacheFor plus MaxStale", err)
+		t.Fatalf("err = %v, want ErrUnavailable once the set was fetched longer than MaxStale ago", err)
 	}
 	if errors.Is(err, ErrBadSignature) {
 		t.Errorf("err = %v, want a set nobody could refresh not to read as a bad signature", err)
@@ -287,6 +288,45 @@ func TestMaxStaleBoundsHowLongTheLastGoodKeySetAnswers(t *testing.T) {
 	clock = now.Add(20 * time.Minute)
 	if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
 		t.Errorf("the key was refused after the issuer came back: %v", err)
+	}
+}
+
+// The bound is measured from the fetch that produced the copy in memory, not
+// from the point it went stale. Counting it past CacheFor would make the oldest
+// a key can be the sum of two settings, so a server asking for five minutes of
+// unconfirmed keys would get six — and the longer CacheFor is, the further the
+// bound it configured drifts from the one it gets.
+func TestMaxStaleIsMeasuredFromTheLastSuccessfulFetch(t *testing.T) {
+	s := newSigner(t)
+	issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
+
+	clock := now
+	set := &JWKS{
+		URL:        issuer.url,
+		CacheFor:   time.Minute,
+		MinRefresh: time.Second,
+		MaxStale:   5 * time.Minute,
+		Now:        func() time.Time { return clock },
+	}
+	if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	issuer.fail(http.StatusInternalServerError)
+
+	clock = now.Add(4 * time.Minute)
+	if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+		t.Errorf("a key fetched four minutes ago was dropped inside the five-minute bound: %v", err)
+	}
+
+	// Past MaxStale from the fetch, and still inside CacheFor plus MaxStale.
+	clock = now.Add(330 * time.Second)
+	_, err := set.Key(context.Background(), "rsa-1")
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable: the copy in memory is older than MaxStale", err)
+	}
+	if !strings.Contains(err.Error(), set.MaxStale.String()) {
+		t.Errorf("the refusal does not name the bound the set outlived: %v", err)
 	}
 }
 

@@ -248,10 +248,13 @@ the tokens it signed expire on their own.
 
 `MaxStale` is for servers that read that the other way: a key the issuer has
 since retired goes on verifying tokens here for as long as the copy in memory
-answers, so the copy is given an expiry date. Past `CacheFor` plus `MaxStale`
-it stops answering and the cache answers `ErrUnavailable` — a `503` and an
-interval to wait, not a verdict on the token, because the signature was never
-checked against anything current. Unset, which is the default, there is no bound.
+answers, so the copy is given an expiry date. It is counted from the fetch that
+produced that copy, not from the point the copy went stale, so `MaxStale` is the
+oldest a key may be when it verifies a signature rather than an extension of
+`CacheFor`. Past it the set stops answering and the cache answers
+`ErrUnavailable` — a `503` and an interval to wait, not a verdict on the token,
+because the signature was never checked against anything current. Unset, which
+is the default, there is no bound.
 
 `OnRefresh` is how that gets watched from outside: it is called once for every
 fetch that actually happens — not for a key answered from memory, not for one
