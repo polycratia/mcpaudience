@@ -495,6 +495,76 @@ func TestMaxStaleIsMeasuredFromTheLastSuccessfulFetch(t *testing.T) {
 	}
 }
 
+// The same two bounds, pinned at the instant itself rather than somewhere past
+// it. Exactly fetched plus CacheFor is where a staleness check on the request
+// path would have fired, and nothing fires: the key id the copy in memory holds
+// is answered there and a nanosecond later, with the issuer left alone — and
+// MinRefresh is not what hides that fetch, because a gap of a whole minute is
+// well past the default interval.
+//
+// MaxStale, set to the same value, is the age the request path does read, and it
+// is a bound that includes its own value: a copy exactly that old still answers,
+// and one a nanosecond older asks the issuer to confirm it first. Reading either
+// comparison the other way moves the boundary by one tick of the clock, which is
+// the kind of difference only a test standing on the boundary catches.
+func TestNoAgeIsReadAtFetchedPlusCacheForAndMaxStaleIncludesItsOwnValue(t *testing.T) {
+	s := newSigner(t)
+
+	t.Run("CacheFor is not a boundary the request path reads", func(t *testing.T) {
+		issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
+
+		clock := now
+		set := &JWKS{URL: issuer.url, CacheFor: time.Minute, Now: func() time.Time { return clock }}
+		if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+			t.Fatal(err)
+		}
+		if got := issuer.count(); got != 1 {
+			t.Fatalf("the issuer was asked %d times for the first fetch, want once", got)
+		}
+
+		for _, age := range []time.Duration{time.Minute, time.Minute + time.Nanosecond} {
+			clock = now.Add(age)
+			if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+				t.Fatalf("a key held by a copy fetched %s ago was refused: %v", age, err)
+			}
+			if got := issuer.count(); got != 1 {
+				t.Errorf("the issuer was asked %d times %s after the fetch, want the copy in memory to have answered", got, age)
+			}
+		}
+	})
+
+	t.Run("MaxStale is, and includes its own value", func(t *testing.T) {
+		issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
+
+		clock := now
+		set := &JWKS{
+			URL:      issuer.url,
+			CacheFor: time.Minute,
+			MaxStale: time.Minute,
+			Now:      func() time.Time { return clock },
+		}
+		if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+			t.Fatal(err)
+		}
+
+		clock = now.Add(time.Minute)
+		if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+			t.Fatalf("a copy exactly MaxStale old was refused: %v", err)
+		}
+		if got := issuer.count(); got != 1 {
+			t.Fatalf("the issuer was asked %d times at exactly MaxStale, want the bound to include its own value", got)
+		}
+
+		clock = now.Add(time.Minute + time.Nanosecond)
+		if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+			t.Fatalf("the key was refused by the fetch that confirmed the copy: %v", err)
+		}
+		if got := issuer.count(); got != 2 {
+			t.Errorf("the issuer was asked %d times a nanosecond past MaxStale, want the copy to have been confirmed", got)
+		}
+	})
+}
+
 // Token expiry is not the same bound, and an outage that outlasts MaxStale is
 // where the two come apart. The tokens the cached key had already signed do
 // expire on their own, but the issuer goes on minting fresh ones on that same
