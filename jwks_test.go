@@ -334,6 +334,50 @@ func TestAFailedOrAbandonedFetchStillSpendsTheRefreshInterval(t *testing.T) {
 	}
 }
 
+// Where the interval ends, exactly. MinRefresh is a floor on the gap between
+// two attempts and the floor includes its own value: a gap of exactly the
+// interval is no longer shorter than it, so the fetch goes out. That boundary is
+// the one clients actually land on, because the wait a 503 names after a failed
+// fetch is the whole of the interval — a caller that waits precisely as long as
+// it was told arrives here, and reading the comparison the other way would
+// decline it and tell it to wait the whole interval over again.
+func TestARefreshAtExactlyMinRefreshAfterAFailedAttemptReachesTheIssuer(t *testing.T) {
+	s := newSigner(t)
+	issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
+	issuer.fail(http.StatusInternalServerError)
+
+	clock := now
+	set := &JWKS{URL: issuer.url, MinRefresh: time.Minute, Now: func() time.Time { return clock }}
+
+	if _, err := set.Key(context.Background(), "rsa-1"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable with no key set held", err)
+	}
+	if got := issuer.count(); got != 1 {
+		t.Fatalf("the issuer was asked %d times for the fetch that failed, want once", got)
+	}
+
+	// A nanosecond short of the interval is still inside it, and the attempt the
+	// failure recorded is what declines this one.
+	clock = now.Add(time.Minute - time.Nanosecond)
+	if _, err := set.Key(context.Background(), "rsa-1"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if got := issuer.count(); got != 1 {
+		t.Fatalf("the issuer was asked %d times a nanosecond inside the interval, want once", got)
+	}
+
+	// Exactly the interval. The issuer is answering again, so the attempt that
+	// goes out at the boundary is also the one that ends the outage.
+	issuer.fail(http.StatusOK)
+	clock = now.Add(time.Minute)
+	if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+		t.Fatalf("a refresh exactly MinRefresh after the failed attempt was declined: %v", err)
+	}
+	if got := issuer.count(); got != 2 {
+		t.Errorf("the issuer was asked %d times, want the attempt at the boundary to have reached it", got)
+	}
+}
+
 // An issuer being unreachable is not evidence that the key it published stopped
 // being its key, and the tokens it signed expire on their own.
 func TestTheLastGoodKeySetSurvivesAnIssuerOutage(t *testing.T) {
