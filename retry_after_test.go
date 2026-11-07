@@ -111,3 +111,48 @@ func TestTheIntervalAFailedFetchJustStartedIsWhatTheClientIsTold(t *testing.T) {
 		t.Errorf("Retry-After = %q, want the 10s interval the failed attempt spent rather than the 30s fallback", got)
 	}
 }
+
+// The interval has to survive the trip through the verifier, because the error
+// the guard builds its 503 on is the one Verify handed back and not the one the
+// cache handed Key. Reading it off JWKS.Key only proves the cache attached it;
+// reading it off Verify proves nothing in between dropped it — a wrap in
+// ErrBadSignature would, leaving the 503 to name the fixed fallback and send
+// every client back at a time this cache never chose.
+func TestTheWaitIsReadOffWhatTheVerifierReturnsRatherThanTheKeySet(t *testing.T) {
+	clock := now
+	keys := &JWKS{
+		// Nothing listens here, so the first fetch fails and starts the interval.
+		URL:        "https://127.0.0.1:1/.well-known/jwks.json",
+		Client:     &http.Client{Timeout: 2 * time.Second},
+		MinRefresh: 45 * time.Second,
+		Now:        func() time.Time { return clock },
+	}
+	if _, err := keys.Key(context.Background(), "rsa-1"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable with no key set held", err)
+	}
+	clock = clock.Add(15 * time.Second)
+
+	s := newSigner(t)
+	v := &JWTVerifier{
+		Resource: resource,
+		Issuers:  []string{"https://auth.example.com"},
+		KeySet:   keys,
+		Now:      func() time.Time { return clock },
+	}
+	_, err := v.Verify(context.Background(), s.sign(t, "RS256", "rsa-1", goodClaims()))
+
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if errors.Is(err, ErrBadSignature) {
+		t.Errorf("err = %v, want nothing about the signature: it was never checked", err)
+	}
+
+	var waiter retryWaiter
+	if !errors.As(err, &waiter) {
+		t.Fatalf("err = %v, want the wait to reach the verifier's caller", err)
+	}
+	if got := waiter.RetryAfter(); got != 30*time.Second {
+		t.Errorf("RetryAfter = %s, want the 30s left of the 45s interval", got)
+	}
+}
