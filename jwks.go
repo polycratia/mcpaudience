@@ -174,6 +174,63 @@ func (j *JWKS) Refresh(ctx context.Context) error {
 	return nil
 }
 
+// Start runs Refresh on a ticker until the returned stop function is called or
+// ctx is done. It is the schedule Refresh talks about, written out: a server
+// that would rather keep the copy in memory warm than meet a rotation on the
+// request that needs it writes this goroutine either way.
+//
+// every is the period. Zero is CacheFor, which refreshes the copy about as
+// often as it would otherwise go stale. MinRefresh does not bound these
+// fetches — the period already does — so the period is what to tune when the
+// issuer should be asked less often.
+//
+// Nothing is fetched before the first tick, and nothing needs to be: the
+// request path still fetches on demand, so starting the ticker is not a step a
+// server has to finish before it can answer anything. The error is the key set
+// URL being one no fetch would accept, so that is learned at startup rather
+// than from a goroutine failing quietly once a period.
+//
+// stop ends the ticker and waits for a fetch in flight to return, cancelling
+// its request, so a server that has shut down is not still asking its issuer
+// for keys. It can be called more than once. A scheduled fetch that failed has
+// no caller left to return the failure to, so OnRefresh is where one is
+// noticed.
+func (j *JWKS) Start(ctx context.Context, every time.Duration) (func(), error) {
+	if err := j.checkURL(); err != nil {
+		return nil, err
+	}
+	if every <= 0 {
+		every = j.cacheFor()
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if ctx.Err() != nil {
+					// A tick and a stop can both be ready. Fetching on a
+					// cancelled context would fail at once and still spend
+					// MinRefresh for the requests arriving behind it.
+					return
+				}
+				_ = j.Refresh(ctx)
+			}
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
+	}, nil
+}
+
 func (j *JWKS) scheduledRefresh(ctx context.Context) (*KeySetRefresh, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()

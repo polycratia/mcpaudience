@@ -273,6 +273,27 @@ across that fetch, and it is handed no context: the caller's belongs to a
 request about to be answered, so anything the callback sends elsewhere needs a
 context and a deadline of its own.
 
+`Refresh` fetches the set now, for a server that would rather keep the copy in
+memory warm on a schedule of its own than meet a rotation on the request that
+needs it, and `Start` is that schedule written out:
+
+```go
+stop, err := keys.Start(ctx, 10*time.Minute)
+if err != nil {
+	return err
+}
+defer stop()
+```
+
+`MinRefresh` does not hold those fetches off — a ticker is already its own bound,
+and the period is what to tune instead — but each attempt is still recorded, so a
+scheduled fetch that has just happened holds the request path off exactly as one
+an arriving token triggered would. A period of zero is `CacheFor`. Nothing is
+fetched before the first tick, because the request path still fetches on demand.
+`stop` ends the ticker and waits for a fetch in flight. The error is the key set
+URL being one no fetch would accept, which a server learns at startup rather
+than from a goroutine failing quietly once a period.
+
 Two refusals happen at fetch time rather than verify time. A key set URL that is
 not `https` is refused before the first request, because a key set an attacker
 on the path can replace is a key set that verifies the attacker's tokens. And a
@@ -342,7 +363,7 @@ Early. It covers the resource-server side and says where it stops.
 
 | | |
 |---|---|
-| Implemented | RFC 9728 metadata document and endpoint, mandatory audience binding, RS256/ES256 verification, JWKS fetching with rotation-aware caching, expiry with clock skew, issuer allow-list, per-tool scopes with named denials, `WWW-Authenticate` challenges, verified principal in the handler's context with the token stripped |
+| Implemented | RFC 9728 metadata document and endpoint, mandatory audience binding, RS256/ES256 verification, JWKS fetching with rotation-aware caching and a background refresh on a ticker, expiry with clock skew, issuer allow-list, per-tool scopes with named denials, `WWW-Authenticate` challenges, verified principal in the handler's context with the token stripped |
 | Not yet | RFC 7662 introspection for opaque tokens, resource indicators on the client side, token caching |
 
 The MCP authorization specification is young and has changed more than once. This

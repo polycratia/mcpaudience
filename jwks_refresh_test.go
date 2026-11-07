@@ -106,3 +106,112 @@ func TestAScheduledRefreshOverPlainHTTPIsRefused(t *testing.T) {
 		t.Errorf("err = %v, want a refusal that names the scheme", err)
 	}
 }
+
+// Start is the schedule written out, so a server that wants the copy in memory
+// kept warm does not write the goroutine itself. What it makes are scheduled
+// fetches — the interval has nothing to hold back, so the rotation is met
+// without a token having to ask for it — and stopping it stops them: a server
+// that has shut down is not still asking its issuer for keys.
+func TestStartFetchesOnATickerUntilItIsStopped(t *testing.T) {
+	old, rotated := newSigner(t), newSigner(t)
+	issuer := newKeyServer(t, rsaJWK("rsa-1", &old.rsaKey.PublicKey))
+
+	fetches := make(chan KeySetRefresh, 16)
+	set := &JWKS{
+		URL:        issuer.url,
+		CacheFor:   time.Hour,
+		MinRefresh: time.Hour,
+		Now:        func() time.Time { return now },
+		OnRefresh: func(r KeySetRefresh) {
+			// Never blocking: a callback waiting on this test would hold the
+			// ticker goroutine that stop() waits for.
+			select {
+			case fetches <- r:
+			default:
+			}
+		},
+	}
+	issuer.publish(rsaJWK("rsa-2", &rotated.rsaKey.PublicKey))
+
+	stop, err := set.Start(context.Background(), 10*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var fetch KeySetRefresh
+	select {
+	case fetch = <-fetches:
+	case <-time.After(10 * time.Second):
+		stop()
+		t.Fatal("the ticker never fetched the key set")
+	}
+	if fetch.KeyID != "" {
+		t.Errorf("KeyID = %q, want none: no token asked for a scheduled fetch", fetch.KeyID)
+	}
+	if len(fetch.KeyIDs) != 1 || fetch.KeyIDs[0] != "rsa-2" || fetch.Err != nil {
+		t.Errorf("fetch = %+v, want the set the ticker brought back", fetch)
+	}
+
+	stop()
+
+	if _, err := set.Key(context.Background(), "rsa-2"); err != nil {
+		t.Errorf("the rotated key was not held after the ticker ran: %v", err)
+	}
+
+	stopped := issuer.count()
+	time.Sleep(50 * time.Millisecond)
+	if got := issuer.count(); got != stopped {
+		t.Errorf("the issuer was asked %d times after stop, want the %d it had been asked by then", got, stopped)
+	}
+
+	stop() // stopping twice is a double defer, not a panic
+}
+
+// No period is CacheFor: the copy is refreshed about as often as it would
+// otherwise go stale, which is the schedule a server reaching for this already
+// configured.
+func TestStartWithNoPeriodTicksOnCacheFor(t *testing.T) {
+	s := newSigner(t)
+	issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
+
+	fetched := make(chan struct{}, 1)
+	set := &JWKS{
+		URL:      issuer.url,
+		CacheFor: 10 * time.Millisecond,
+		Now:      func() time.Time { return now },
+		OnRefresh: func(KeySetRefresh) {
+			select {
+			case fetched <- struct{}{}:
+			default:
+			}
+		},
+	}
+
+	stop, err := set.Start(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+
+	select {
+	case <-fetched:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no fetch was made on the CacheFor period")
+	}
+}
+
+// A URL no fetch would accept is reported to whoever started the ticker, rather
+// than to a goroutine that fails quietly once a period for the life of the
+// process.
+func TestStartRefusesAKeySetURLNoFetchWouldAccept(t *testing.T) {
+	set := &JWKS{URL: "http://auth.example.com/.well-known/jwks.json"}
+
+	stop, err := set.Start(context.Background(), time.Minute)
+	if err == nil {
+		stop()
+		t.Fatal("a ticker was started against a key set URL that will never be fetched")
+	}
+	if !strings.Contains(err.Error(), "https") {
+		t.Errorf("err = %v, want a refusal that names the scheme", err)
+	}
+}
