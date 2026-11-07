@@ -256,6 +256,14 @@ oldest a key may be when it verifies a signature rather than an extension of
 because the signature was never checked against anything current. Unset, which
 is the default, there is no bound.
 
+The interval that `503` names is the one this cache is actually holding, because
+the failure carries it: what is left of `MinRefresh` when the next fetch was
+declined, and the whole of it when the fetch that just failed is what started
+it. The fixed 30s is only the fallback, for a failure that names no interval at
+all — telling a client to come back in thirty seconds while the cache will
+refuse to refetch for the next five minutes is the kind of guess that turns an
+outage into a retry storm.
+
 `OnRefresh` is how that gets watched from outside: it is called once for every
 fetch that actually happens — not for a key answered from memory, not for one
 `MinRefresh` declined to make — with the `kid` that triggered it, the key ids the

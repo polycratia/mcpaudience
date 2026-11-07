@@ -82,3 +82,32 @@ func TestTheWaitLeftOnTheRefreshIntervalIsWhatTheClientIsTold(t *testing.T) {
 		t.Errorf("Retry-After = %q, want the 500ms left on the interval rounded up to 1", got)
 	}
 }
+
+// The failure that starts the interval knows it too. The attempt is recorded
+// before the request goes out, so a fetch that fails holds the next one off for
+// the whole of MinRefresh — and that, not the fallback, is the wait the 503
+// names. The fallback is left for a failure that says nothing at all.
+func TestTheIntervalAFailedFetchJustStartedIsWhatTheClientIsTold(t *testing.T) {
+	keys := &JWKS{
+		// Nothing listens here, so this first fetch fails.
+		URL:        "https://127.0.0.1:1/.well-known/jwks.json",
+		Client:     &http.Client{Timeout: 2 * time.Second},
+		MinRefresh: 10 * time.Second,
+		Now:        func() time.Time { return now },
+	}
+	s := newSigner(t)
+	v := &JWTVerifier{
+		Resource: resource,
+		Issuers:  []string{"https://auth.example.com"},
+		KeySet:   keys,
+		Now:      func() time.Time { return now },
+	}
+	response := call(guard(v), okHandler(), "Bearer "+s.sign(t, "RS256", "rsa-1", goodClaims()))
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", response.Code)
+	}
+	if got := response.Header().Get("Retry-After"); got != "10" {
+		t.Errorf("Retry-After = %q, want the 10s interval the failed attempt spent rather than the 30s fallback", got)
+	}
+}

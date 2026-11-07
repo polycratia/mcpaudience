@@ -21,10 +21,14 @@ type Guard struct {
 	RequiredScopes []string
 }
 
-// defaultRetryAfter is what a client is told to wait when the issuer's keys
-// could not be reached and the failure does not say when it will clear: long
-// enough that a fleet of clients does not turn the outage into a retry storm,
-// short enough to be a pause rather than a refusal.
+// defaultRetryAfter is the last resort: what a client is told to wait when the
+// issuer's keys could not be reached and the failure does not say when it will
+// clear. Long enough that a fleet of clients does not turn the outage into a
+// retry storm, short enough to be a pause rather than a refusal.
+//
+// A failure from the key set cache does say, so this is not the usual answer.
+// It is the figure left for a verifier of someone else's that reports an
+// outage without naming one.
 const defaultRetryAfter = 30 * time.Second
 
 // retryWaiter is a failure that knows how long it will go on failing, so the
@@ -207,8 +211,10 @@ func writeChallenge(w http.ResponseWriter, metadataURL string, requiredScopes []
 }
 
 // retryAfterSeconds is the interval a client is told to wait. A failure that
-// knows when it will clear says so — the key set cache holding the next fetch
-// off knows what is left of its interval — and anything else gets the default.
+// knows when it will clear says so — the key set cache names what is left of
+// its refresh interval when it declined the fetch, and the whole interval when
+// the fetch it just made is what started it — and only a failure that names
+// nothing falls back to the default.
 //
 // The division rounds up. Truncating it renders every wait shorter than a
 // second as "0", and a client told to wait no time at all comes straight back

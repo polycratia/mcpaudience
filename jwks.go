@@ -56,6 +56,11 @@ type JWKS struct {
 	// damage. The cost is that recovery is not immediate — the last good set
 	// keeps answering until the interval lapses, and a cache that never held one
 	// answers ErrUnavailable until then.
+	//
+	// The failures carry the interval with them, so a 503 built on one names the
+	// wait this cache is holding rather than a fixed guess: what is left of the
+	// interval when a fetch was declined, and the whole of it when the fetch
+	// that just failed is what started it.
 	MinRefresh time.Duration
 	// MaxStale bounds how long the last good set goes on answering once it can
 	// no longer be refreshed. It is measured from the fetch that produced the
@@ -189,6 +194,21 @@ func (t tooSoon) Error() string {
 
 func (t tooSoon) RetryAfter() time.Duration { return t.interval - t.since }
 
+// unreachable is a fetch that went out and did not produce a set. The attempt
+// was recorded before the request, so the next fetch is held off for the whole
+// interval, and that — not a fixed guess — is the wait a 503 built on this
+// failure should name.
+type unreachable struct {
+	err      error
+	interval time.Duration
+}
+
+func (u unreachable) Error() string { return u.err.Error() }
+
+func (u unreachable) Unwrap() error { return u.err }
+
+func (u unreachable) RetryAfter() time.Duration { return u.interval }
+
 func (j *JWKS) refresh(ctx context.Context, kid string) (*KeySetRefresh, error) {
 	now := j.now()
 	if since := now.Sub(j.attempted); !j.attempted.IsZero() && since < j.minRefresh() {
@@ -202,13 +222,13 @@ func (j *JWKS) refresh(ctx context.Context, kid string) (*KeySetRefresh, error) 
 	body, err := j.get(ctx)
 	if err != nil {
 		fetch.Err = err
-		return fetch, err
+		return fetch, unreachable{err: err, interval: j.minRefresh()}
 	}
 	keys, skipped, err := parseKeySet(body)
 	if err != nil {
 		err = fmt.Errorf("%s: %v", j.URL, err)
 		fetch.Err = err
-		return fetch, err
+		return fetch, unreachable{err: err, interval: j.minRefresh()}
 	}
 	j.keys, j.skipped, j.fetched = keys, skipped, now
 	fetch.KeyIDs = slices.Sorted(maps.Keys(keys))
