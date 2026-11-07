@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Guard protects an MCP server's HTTP endpoint.
@@ -19,10 +21,17 @@ type Guard struct {
 	RequiredScopes []string
 }
 
-// retryAfter is what a client is told to wait when the issuer's keys could not
-// be reached: long enough that a fleet of clients does not turn the outage into
-// a retry storm, short enough to be a pause rather than a refusal.
-const retryAfter = "30"
+// defaultRetryAfter is what a client is told to wait when the issuer's keys
+// could not be reached and the failure does not say when it will clear: long
+// enough that a fleet of clients does not turn the outage into a retry storm,
+// short enough to be a pause rather than a refusal.
+const defaultRetryAfter = 30 * time.Second
+
+// retryWaiter is a failure that knows how long it will go on failing, so the
+// 503 can name the wait the server is actually holding rather than a guess.
+type retryWaiter interface {
+	RetryAfter() time.Duration
+}
 
 // Handler wraps next so that only requests with a token for this resource
 // reach it, and so that what reaches it is the principal rather than the token.
@@ -162,7 +171,7 @@ func writeChallenge(w http.ResponseWriter, metadataURL string, requiredScopes []
 		// No verdict was reached, so there is nothing to challenge: the token may
 		// well be fine. A 401 invalid_token would send the client to its issuer
 		// for a replacement that fails the same way until the keys come back.
-		w.Header().Set("Retry-After", retryAfter)
+		w.Header().Set("Retry-After", retryAfterSeconds(err))
 		http.Error(w, "mcpaudience: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -195,6 +204,23 @@ func writeChallenge(w http.ResponseWriter, metadataURL string, requiredScopes []
 
 	w.Header().Set("WWW-Authenticate", strings.Join(parts, ", "))
 	http.Error(w, err.Error(), code)
+}
+
+// retryAfterSeconds is the interval a client is told to wait. A failure that
+// knows when it will clear says so — the key set cache holding the next fetch
+// off knows what is left of its interval — and anything else gets the default.
+//
+// The division rounds up. Truncating it renders every wait shorter than a
+// second as "0", and a client told to wait no time at all comes straight back
+// to the same failure and is told "0" again, which is the retry storm the
+// header exists to prevent.
+func retryAfterSeconds(err error) string {
+	wait := defaultRetryAfter
+	var waiter retryWaiter
+	if errors.As(err, &waiter) && waiter.RetryAfter() > 0 {
+		wait = waiter.RetryAfter()
+	}
+	return strconv.FormatInt(int64((wait+time.Second-1)/time.Second), 10)
 }
 
 // firstChallenge is the header a request carrying no credential at all gets.

@@ -152,13 +152,13 @@ func (j *JWKS) key(ctx context.Context, kid string) (crypto.PublicKey, *KeySetRe
 			return cached, fetch, nil
 		}
 		if len(j.keys) == 0 {
-			return nil, fetch, fmt.Errorf("%w: no key set from %s is held: %v", ErrUnavailable, j.URL, err)
+			return nil, fetch, fmt.Errorf("%w: no key set from %s is held: %w", ErrUnavailable, j.URL, err)
 		}
 		if beyond {
 			// The copy in memory outlived what it was allowed to answer for, so
 			// there is no verdict left to give: whether the issuer still
 			// publishes this key is no longer known.
-			return nil, fetch, fmt.Errorf("%w: the key set from %s was last fetched %s ago, past the %s it may answer for without being confirmed: %v",
+			return nil, fetch, fmt.Errorf("%w: the key set from %s was last fetched %s ago, past the %s it may answer for without being confirmed: %w",
 				ErrUnavailable, j.URL, j.now().Sub(j.fetched).Round(time.Second), j.MaxStale, err)
 		}
 		// A set is held and does not name this kid, which is a verdict rather
@@ -174,11 +174,25 @@ func (j *JWKS) key(ctx context.Context, kid string) (crypto.PublicKey, *KeySetRe
 	return nil, fetch, fmt.Errorf("no key for kid %q in the key set at %s", kid, j.URL)
 }
 
+// tooSoon is the refusal MinRefresh makes. It carries what is left of the
+// interval, so a 503 built on top of it can name the wait this cache is
+// actually holding rather than a fixed guess.
+type tooSoon struct {
+	since    time.Duration
+	interval time.Duration
+}
+
+func (t tooSoon) Error() string {
+	return fmt.Sprintf("the key set was fetched %s ago and is not fetched again more than once every %s",
+		t.since.Round(time.Second), t.interval)
+}
+
+func (t tooSoon) RetryAfter() time.Duration { return t.interval - t.since }
+
 func (j *JWKS) refresh(ctx context.Context, kid string) (*KeySetRefresh, error) {
 	now := j.now()
 	if since := now.Sub(j.attempted); !j.attempted.IsZero() && since < j.minRefresh() {
-		return nil, fmt.Errorf("the key set was fetched %s ago and is not fetched again more than once every %s",
-			since.Round(time.Second), j.minRefresh())
+		return nil, tooSoon{since: since, interval: j.minRefresh()}
 	}
 	// Recorded before the fetch rather than after it, so an attempt that fails
 	// or is abandoned spends the interval too.
