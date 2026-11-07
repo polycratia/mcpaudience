@@ -228,82 +228,86 @@ endpoint, fetched on demand and kept in memory:
 Verifier: &mcpaudience.JWTVerifier{
 	Resource: "https://mcp.example.com",
 	Issuers:  []string{"https://auth.example.com"},
-	KeySet:   &mcpaudience.JWKS{URL: "https://auth.example.com/.well-known/jwks.json"},
-	Skew:     30 * time.Second,
+	KeySet: &mcpaudience.JWKS{
+		URL:        "https://auth.example.com/.well-known/jwks.json",
+		MinRefresh: time.Minute,
+		MaxStale:   12 * time.Hour,
+	},
+	Skew: 30 * time.Second,
 }
 ```
 
-Rotation is why the cache is not a TTL. An authorization server starts signing
-with a new key the moment it publishes it, and a resource server that only
-refetches when a timer lapses refuses every token minted in between — for
-minutes, over nothing. So an unknown `kid` is read as the signal it is, and
-refetches the set. That would also be a free way to make this server hammer its
-issuer, one request per invented key id, which is what `MinRefresh` is for: at
-most one fetch per interval, and a `kid` nobody published is refused from the
-copy already in memory.
+### The refresh model
 
-Which leaves no timer on the request path at all. `CacheFor` is the period
-`Start` refreshes on, not a staleness check consulted when a token arrives: a
-`kid` the copy in memory holds is answered from it however long ago the set was
-fetched. Expiring the copy there bought nothing it did not also charge for — the
-lapse made whichever token turned up next pay for a fetch, without making the
-copy any more current for the `kid` that token already named — so keeping the
-copy fresh is a schedule the server runs, and meeting a rotation is still the
-request path's job, because a `kid` it does not hold fetches.
+A fetch is keyed on a key id, not on a timer. An authorization server starts
+signing with a new key the moment it publishes it, and a resource server that
+only refetches when a timer lapses refuses every token minted in between — for
+minutes, over nothing. So a `kid` the copy in memory holds is answered from it
+however long ago that copy was fetched, and a `kid` it does not hold is read as
+the rotation it probably is, and fetches.
 
-When the issuer cannot be reached, the last good set keeps answering. An issuer
-being down is not evidence that the key it published stopped being its key, and
-the tokens it signed expire on their own.
+That would also be a free way to make this server hammer its issuer, one request
+per invented key id, which is what `MinRefresh` bounds: at most one fetch per
+interval on the request path, and a `kid` nobody published is refused from the
+copy already in memory until the interval is up. The attempt is recorded before
+the request goes out, so a failed attempt spends the interval exactly as a
+successful one does — an issuer that is down is not asked again by whichever
+token arrives next.
 
-`MaxStale` is for servers that read that the other way: a key the issuer has
-since retired goes on verifying tokens here for as long as the copy in memory
-answers, so the copy is given an expiry date. It is counted from the fetch that
-produced that copy, so it is the oldest a key may be when it verifies a
-signature, and it is the one age the request path does read: past the bound, a
+`MaxStale` is for servers that read the cache the other way round: a key the
+issuer has since retired goes on verifying tokens here for as long as the copy
+in memory answers, so the copy is given an expiry date. It is counted from the
+fetch that produced that copy, so it is the oldest a key may be when it verifies
+a signature, and it is the one age the request path does read: past the bound, a
 token naming a key the copy holds asks the issuer to confirm it first. If the
-issuer cannot be reached the cache answers `ErrUnavailable` — a `503` and an
-interval to wait, not a verdict on the token, because the signature was never
+issuer cannot be reached the caller gets `ErrUnavailable` — a `503` with
+`Retry-After`, not a verdict on the token, because the signature was never
 checked against anything current. Unset, which is the default, there is no
-bound.
+bound: the last good set keeps answering, because an issuer being down is not
+evidence that the key it published stopped being its key, and the tokens it
+signed expire on their own.
 
-The interval that `503` names is the one this cache is actually holding, because
-the failure carries it: what is left of `MinRefresh` when the next fetch was
-declined, and the whole of it when the fetch that just failed is what started
-it. The fixed 30s is only the fallback, for a failure that names no interval at
-all — telling a client to come back in thirty seconds while the cache will
-refuse to refetch for the next five minutes is the kind of guess that turns an
-outage into a retry storm.
-
-`OnRefresh` is how that gets watched from outside: it is called once for every
-fetch that actually happens — not for a key answered from memory, not for one
-`MinRefresh` declined to make — with the `kid` that triggered it, the key ids the
-set came back with, and the error if it failed. It runs on the goroutine of the
-request whose token triggered the fetch, after `Key` has released the lock held
-across that fetch, and it is handed no context: the caller's belongs to a
-request about to be answered, so anything the callback sends elsewhere needs a
-context and a deadline of its own.
-
-`Refresh` fetches the set now, for a server that would rather keep the copy in
-memory warm on a schedule of its own than meet a rotation on the request that
-needs it, and `Start` is that schedule written out:
+`Start` is the optional other half — a ticker that keeps the copy warm, so a
+rotation is usually met before a token has to pay for it:
 
 ```go
-stop, err := keys.Start(ctx, 10*time.Minute)
+stop, err := keys.Start(ctx, 0) // zero is CacheFor
 if err != nil {
 	return err
 }
 defer stop()
 ```
 
-`MinRefresh` does not hold those fetches off — a ticker is already its own bound,
-and the period is what to tune instead — but each attempt is still recorded, so a
-scheduled fetch that has just happened holds the request path off exactly as one
-an arriving token triggered would. A period of zero is `CacheFor`, which is the
-setting that period belongs to. Nothing is fetched before the first tick,
-because the request path still fetches on demand. `stop` ends the ticker and
-waits for a fetch in flight. The error is the key set URL being one no fetch
-would accept, which a server learns at startup rather than from a goroutine
-failing quietly once a period.
+`CacheFor` is that tick interval and nothing else: it is not a staleness check
+consulted when a token arrives. `MinRefresh` does not hold a scheduled fetch off
+— a ticker is already its own bound, and the period is what to tune instead —
+but each one still records its attempt, so a scheduled fetch that has just
+happened holds the request path off exactly as one an arriving token triggered
+would. Nothing is fetched before the first tick, because the request path still
+fetches on demand. `stop` ends the ticker and waits for a fetch in flight, and
+calling it twice is a double defer rather than a panic. The error is the key set
+URL being one no fetch would accept, which a server learns at startup rather
+than from a goroutine failing quietly once a period. `Refresh` is the single
+fetch that ticker makes, for a server that would rather run the schedule itself.
+
+The interval that `503` names is the one this cache is actually holding, because
+the failure carries it: what is left of `MinRefresh` when the next fetch was
+declined, and the whole of it when the fetch that just failed is what started
+it. `Retry-After` is whole seconds and the conversion rounds up, because a wait
+shorter than a second is still a wait and a client told to wait `0` comes
+straight back into the failure. The fixed 30s is only the fallback, for a
+failure that names no interval at all — telling a client to come back in thirty
+seconds while the cache will refuse to refetch for the next five minutes is the
+kind of guess that turns an outage into a retry storm.
+
+`OnRefresh` is how all of that gets watched from outside: it is called once for
+every fetch that actually happens — not for a key answered from memory, not for
+one `MinRefresh` declined to make — with the `kid` that triggered it, the key ids
+the set came back with, and the error if it failed. It runs on the goroutine of
+the request whose token triggered the fetch, after `Key` has released the lock
+held across that fetch, and it is handed no context: the caller's belongs to a
+request about to be answered, so anything the callback sends elsewhere needs a
+context and a deadline of its own.
 
 Two refusals happen at fetch time rather than verify time. A key set URL that is
 not `https` is refused before the first request, because a key set an attacker
