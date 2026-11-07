@@ -44,8 +44,8 @@ type JWKS struct {
 	// CacheFor is how long a fetched set is served before it is fetched again.
 	// Defaults to 15 minutes.
 	CacheFor time.Duration
-	// MinRefresh is the shortest gap between two fetches, whatever asks for one.
-	// Defaults to 30 seconds.
+	// MinRefresh is the shortest gap between two fetches an arriving token asks
+	// for, whatever about that token asks for one. Defaults to 30 seconds.
 	//
 	// The interval is spent by the attempt rather than by its result: it is
 	// recorded before the request goes out, so a fetch that failed — or one
@@ -56,6 +56,11 @@ type JWKS struct {
 	// damage. The cost is that recovery is not immediate — the last good set
 	// keeps answering until the interval lapses, and a cache that never held one
 	// answers ErrUnavailable until then.
+	//
+	// It does not bound a refresh the server makes on a schedule of its own:
+	// Refresh fetches whatever the interval would have said, because a schedule
+	// is already its own bound. The attempt it makes is still recorded, so the
+	// requests arriving behind it read it like any other.
 	//
 	// The failures carry the interval with them, so a 503 built on one names the
 	// wait this cache is holding rather than a fixed guess: what is left of the
@@ -103,7 +108,8 @@ type JWKS struct {
 
 // KeySetRefresh is one fetch of the key set, as reported to OnRefresh.
 type KeySetRefresh struct {
-	// KeyID is the key id whose absence or staleness triggered the fetch.
+	// KeyID is the key id whose absence or staleness triggered the fetch. It is
+	// empty when no token did: a Refresh made on the server's own schedule.
 	KeyID string
 	// KeyIDs are the usable key ids the fetched set carried, sorted. It is
 	// empty when the fetch produced no set.
@@ -136,6 +142,44 @@ func (j *JWKS) Key(ctx context.Context, kid string) (crypto.PublicKey, error) {
 	return key, err
 }
 
+// Refresh fetches the key set now, for a server that would rather keep the copy
+// in memory warm on a schedule of its own than meet a rotation on the request
+// that needs it.
+//
+// MinRefresh does not apply here. The interval exists so that the fetches
+// arriving tokens ask for cannot multiply with those tokens — a stream of
+// invented key ids becoming a stream of requests at the issuer — and a caller
+// with a ticker is already bounded by its own period, which is the thing to
+// tune instead. The attempt is still recorded, before the request goes out, so
+// a scheduled fetch that has just happened or just failed holds the request
+// path off exactly as one an arriving token triggered would: the interval is
+// spent by the attempt, whoever made it.
+//
+// It takes the same lock the request path holds across its fetch, so a
+// scheduled refresh and a rotation an arriving token found do not both go out,
+// and OnRefresh is reported on this caller's goroutine with no key id, because
+// no token asked for this one.
+func (j *JWKS) Refresh(ctx context.Context) error {
+	if err := j.checkURL(); err != nil {
+		return err
+	}
+
+	fetch, err := j.scheduledRefresh(ctx)
+	if fetch != nil && j.OnRefresh != nil {
+		j.OnRefresh(*fetch)
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
+	}
+	return nil
+}
+
+func (j *JWKS) scheduledRefresh(ctx context.Context) (*KeySetRefresh, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.refresh(ctx, "", ownSchedule)
+}
+
 // key does the lookup and hands back the fetch it made, if it made one, for the
 // caller to report once the lock is gone.
 func (j *JWKS) key(ctx context.Context, kid string) (crypto.PublicKey, *KeySetRefresh, error) {
@@ -148,7 +192,7 @@ func (j *JWKS) key(ctx context.Context, kid string) (crypto.PublicKey, *KeySetRe
 	if known && !j.stale() {
 		return cached, nil, nil
 	}
-	fetch, err := j.refresh(ctx, kid)
+	fetch, err := j.refresh(ctx, kid, arrivingToken)
 	if err != nil {
 		beyond := j.beyondMaxStale()
 		if known && !beyond {
@@ -209,13 +253,23 @@ func (u unreachable) Unwrap() error { return u.err }
 
 func (u unreachable) RetryAfter() time.Duration { return u.interval }
 
-func (j *JWKS) refresh(ctx context.Context, kid string) (*KeySetRefresh, error) {
+// trigger is what asked for a fetch, which is what decides whether MinRefresh
+// has anything to say about it.
+type trigger bool
+
+const (
+	arrivingToken trigger = false
+	ownSchedule   trigger = true
+)
+
+func (j *JWKS) refresh(ctx context.Context, kid string, asked trigger) (*KeySetRefresh, error) {
 	now := j.now()
-	if since := now.Sub(j.attempted); !j.attempted.IsZero() && since < j.minRefresh() {
+	if since := now.Sub(j.attempted); asked == arrivingToken && !j.attempted.IsZero() && since < j.minRefresh() {
 		return nil, tooSoon{since: since, interval: j.minRefresh()}
 	}
 	// Recorded before the fetch rather than after it, so an attempt that fails
-	// or is abandoned spends the interval too.
+	// or is abandoned spends the interval too — including one the interval did
+	// not hold back, because what the request path reads is the attempt.
 	j.attempted = now
 	fetch := &KeySetRefresh{KeyID: kid, At: now}
 
