@@ -263,12 +263,38 @@ func TestAnUnreachableKeySetIsNotReportedAsABadSignature(t *testing.T) {
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v, want ErrUnavailable", err)
 	}
+
+	var waiter retryWaiter
+	if !errors.As(err, &waiter) {
+		t.Errorf("err = %v, want it to carry the %s the cache is holding", err, failure.wait)
+	} else if waiter.RetryAfter() != failure.wait {
+		t.Errorf("RetryAfter = %s, want the %s the cache is holding", waiter.RetryAfter(), failure.wait)
+	}
 	if errors.Is(err, ErrBadSignature) {
 		t.Errorf("err = %v, want nothing about the signature: it was never checked", err)
 	}
+}
 
+// The other half of the same distinction. A key source that answered and has no
+// key for this kid is a verdict on the token, so it is ErrBadSignature and it
+// names no wait: telling a client to come back later for a key nobody published
+// would hold it off for an interval that will change nothing.
+func TestAKeySourceFailureThatIsNotAnOutageIsABadSignature(t *testing.T) {
+	s := newSigner(t)
+
+	v := verifier(s)
+	v.Keys = nil
+	v.KeySet = failingKeySource{err: errors.New("no key for kid \"rsa-1\" in the key set")}
+
+	_, err := v.Verify(context.Background(), s.sign(t, "RS256", "rsa-1", goodClaims()))
+	if !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("err = %v, want ErrBadSignature", err)
+	}
+	if errors.Is(err, ErrUnavailable) {
+		t.Errorf("err = %v, want no 503: the key set answered", err)
+	}
 	var waiter retryWaiter
-	if !errors.As(err, &waiter) || waiter.RetryAfter() != failure.wait {
-		t.Errorf("err = %v, want it to carry the %s the cache is holding", err, failure.wait)
+	if errors.As(err, &waiter) {
+		t.Errorf("err = %v, want it to carry no retry interval", err)
 	}
 }
