@@ -238,6 +238,58 @@ func TestTheLastGoodKeySetSurvivesAnIssuerOutage(t *testing.T) {
 	}
 }
 
+// MaxStale is the other reading of the same outage: a copy of the set that can
+// no longer be confirmed stops answering once it is that far past its refresh,
+// and what it answers then is the outage rather than a verdict on the token.
+func TestMaxStaleBoundsHowLongTheLastGoodKeySetAnswers(t *testing.T) {
+	s := newSigner(t)
+	issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
+
+	clock := now
+	set := &JWKS{
+		URL:        issuer.url,
+		CacheFor:   time.Minute,
+		MinRefresh: time.Second,
+		MaxStale:   10 * time.Minute,
+		Now:        func() time.Time { return clock },
+	}
+	if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	issuer.fail(http.StatusInternalServerError)
+
+	clock = now.Add(5 * time.Minute)
+	if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+		t.Errorf("a cached key was dropped while it was still inside MaxStale: %v", err)
+	}
+
+	clock = now.Add(12 * time.Minute)
+	_, err := set.Key(context.Background(), "rsa-1")
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable once the set is older than CacheFor plus MaxStale", err)
+	}
+	if errors.Is(err, ErrBadSignature) {
+		t.Errorf("err = %v, want a set nobody could refresh not to read as a bad signature", err)
+	}
+
+	// A 503 is what the guard turns that into: the signature was never checked
+	// against anything current, so there is nothing to challenge.
+	v := keySetVerifier(set)
+	response := call(guard(v), okHandler(), "Bearer "+s.sign(t, "RS256", "rsa-1", goodClaims()))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", response.Code)
+	}
+
+	// The issuer answering again is what ends it, and the copy in memory is
+	// usable the moment it can be confirmed.
+	issuer.fail(http.StatusOK)
+	clock = now.Add(20 * time.Minute)
+	if _, err := set.Key(context.Background(), "rsa-1"); err != nil {
+		t.Errorf("the key was refused after the issuer came back: %v", err)
+	}
+}
+
 // A cold cache has no last good set to fall back on, and that is not a verdict
 // on the token: the signature was never checked. A 401 invalid_token would send
 // the client to its issuer for a replacement that fails the same way, so the

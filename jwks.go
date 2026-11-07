@@ -57,6 +57,21 @@ type JWKS struct {
 	// keeps answering until the interval lapses, and a cache that never held one
 	// answers ErrUnavailable until then.
 	MinRefresh time.Duration
+	// MaxStale bounds how long the last good set goes on answering once it can
+	// no longer be refreshed. It is measured past the point the set went stale,
+	// so a copy in memory answers for CacheFor and then for MaxStale beyond it.
+	// Zero, the default, is no bound: an issuer being unreachable is not
+	// evidence that the key it published stopped being its key, and the tokens
+	// it signed expire on their own.
+	//
+	// Setting it is the other reading of the same fact. A key the issuer has
+	// since retired keeps verifying tokens here for as long as the copy in
+	// memory answers, so a server that would rather refuse than verify against
+	// a set it can no longer confirm gives that copy an expiry date. Past the
+	// bound the cache answers ErrUnavailable — a 503 and an interval to wait,
+	// not a verdict on the token, because the signature still has not been
+	// checked against anything current.
+	MaxStale time.Duration
 	// OnRefresh, if set, is called once for every fetch of the key set that
 	// actually happens: not for a key answered from memory, and not for one
 	// MinRefresh declined to make.
@@ -101,7 +116,8 @@ const maxKeySetBytes = 1 << 20
 //
 // A fetch that fails with no copy of the set in memory is ErrUnavailable rather
 // than an unknown key: the issuer was never reached, so nothing has been
-// learned about the token that named this key id.
+// learned about the token that named this key id. A copy that has gone past
+// MaxStale answers the same way, for the same reason.
 func (j *JWKS) Key(ctx context.Context, kid string) (crypto.PublicKey, error) {
 	if err := j.checkURL(); err != nil {
 		return nil, err
@@ -128,13 +144,21 @@ func (j *JWKS) key(ctx context.Context, kid string) (crypto.PublicKey, *KeySetRe
 	}
 	fetch, err := j.refresh(ctx, kid)
 	if err != nil {
-		if known {
+		beyond := j.beyondMaxStale()
+		if known && !beyond {
 			// An issuer being unreachable is not evidence that the key it
 			// published stopped being its key. Tokens still expire on their own.
 			return cached, fetch, nil
 		}
 		if len(j.keys) == 0 {
 			return nil, fetch, fmt.Errorf("%w: no key set from %s is held: %v", ErrUnavailable, j.URL, err)
+		}
+		if beyond {
+			// The copy in memory outlived what it was allowed to answer for, so
+			// there is no verdict left to give: whether the issuer still
+			// publishes this key is no longer known.
+			return nil, fetch, fmt.Errorf("%w: the key set from %s was last fetched %s ago, past the %s it may be served stale for: %v",
+				ErrUnavailable, j.URL, j.now().Sub(j.fetched).Round(time.Second), j.MaxStale, err)
 		}
 		// A set is held and does not name this kid, which is a verdict rather
 		// than an outage, whatever the failed refresh was about.
@@ -215,6 +239,15 @@ func (j *JWKS) checkURL() error {
 
 func (j *JWKS) stale() bool {
 	return j.fetched.IsZero() || j.now().Sub(j.fetched) >= j.cacheFor()
+}
+
+// beyondMaxStale reports whether the set in memory has gone longer without a
+// successful fetch than MaxStale allows it to keep answering for.
+func (j *JWKS) beyondMaxStale() bool {
+	if j.MaxStale <= 0 || j.fetched.IsZero() {
+		return false
+	}
+	return j.now().Sub(j.fetched) > j.cacheFor()+j.MaxStale
 }
 
 func (j *JWKS) client() *http.Client {
