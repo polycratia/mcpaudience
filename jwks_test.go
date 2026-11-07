@@ -154,6 +154,53 @@ func TestAnUnknownKeyIDIsNotAFetchPerToken(t *testing.T) {
 	}
 }
 
+// The same promise when the tokens arrive together rather than one after
+// another, which is the shape that actually turns up: a client with a stale or
+// invented kid retries, and a server under load has those retries in flight at
+// once. MinRefresh alone would not settle it — the interval is read and recorded
+// under j.mu, and the lock is held across the fetch, so the callers queued
+// behind the first one find the attempt already spent instead of each starting
+// one of their own.
+func TestParallelVerifiesOnAnUnknownKeyIDFetchTheKeySetOnce(t *testing.T) {
+	s := newSigner(t)
+	issuer := newKeyServer(t, rsaJWK("rsa-1", &s.rsaKey.PublicKey))
+	v := keySetVerifier(&JWKS{URL: issuer.url, MinRefresh: time.Minute, Now: func() time.Time { return now }})
+	// Signed before the goroutines start: the signer needs the test's t.
+	token := s.sign(t, "RS256", "invented", goodClaims())
+
+	const callers = 32
+	start := make(chan struct{})
+	failures := make(chan error, callers)
+	var ready, done sync.WaitGroup
+	ready.Add(callers)
+	done.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer done.Done()
+			ready.Done()
+			<-start
+			_, err := v.Verify(context.Background(), token)
+			failures <- err
+		}()
+	}
+	ready.Wait()
+	close(start)
+	done.Wait()
+	close(failures)
+
+	for err := range failures {
+		if !errors.Is(err, ErrBadSignature) {
+			t.Fatalf("err = %v, want ErrBadSignature from every caller", err)
+		}
+		if errors.Is(err, ErrUnavailable) {
+			t.Errorf("err = %v, want a key id nobody published not to read as an outage", err)
+		}
+	}
+	if got := issuer.count(); got != 1 {
+		t.Errorf("the issuer was asked %d times by %d parallel verifies naming a key id it never published, want once", got, callers)
+	}
+}
+
 // The interval is spent by the attempt, not by its result: the attempt is
 // recorded before the fetch is made, so a failed one and an abandoned one hold
 // the next fetch off for just as long as a successful one. That is the case the
