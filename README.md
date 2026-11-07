@@ -233,14 +233,23 @@ Verifier: &mcpaudience.JWTVerifier{
 }
 ```
 
-Rotation is why the cache is not a plain TTL. An authorization server starts
-signing with a new key the moment it publishes it, and a resource server that
-only refetches when its cache expires refuses every token minted in between —
-for minutes, over nothing. So an unknown `kid` is read as the signal it is, and
+Rotation is why the cache is not a TTL. An authorization server starts signing
+with a new key the moment it publishes it, and a resource server that only
+refetches when a timer lapses refuses every token minted in between — for
+minutes, over nothing. So an unknown `kid` is read as the signal it is, and
 refetches the set. That would also be a free way to make this server hammer its
 issuer, one request per invented key id, which is what `MinRefresh` is for: at
 most one fetch per interval, and a `kid` nobody published is refused from the
 copy already in memory.
+
+Which leaves no timer on the request path at all. `CacheFor` is the period
+`Start` refreshes on, not a staleness check consulted when a token arrives: a
+`kid` the copy in memory holds is answered from it however long ago the set was
+fetched. Expiring the copy there bought nothing it did not also charge for — the
+lapse made whichever token turned up next pay for a fetch, without making the
+copy any more current for the `kid` that token already named — so keeping the
+copy fresh is a schedule the server runs, and meeting a rotation is still the
+request path's job, because a `kid` it does not hold fetches.
 
 When the issuer cannot be reached, the last good set keeps answering. An issuer
 being down is not evidence that the key it published stopped being its key, and
@@ -249,12 +258,13 @@ the tokens it signed expire on their own.
 `MaxStale` is for servers that read that the other way: a key the issuer has
 since retired goes on verifying tokens here for as long as the copy in memory
 answers, so the copy is given an expiry date. It is counted from the fetch that
-produced that copy, not from the point the copy went stale, so `MaxStale` is the
-oldest a key may be when it verifies a signature rather than an extension of
-`CacheFor`. Past it the set stops answering and the cache answers
-`ErrUnavailable` — a `503` and an interval to wait, not a verdict on the token,
-because the signature was never checked against anything current. Unset, which
-is the default, there is no bound.
+produced that copy, so it is the oldest a key may be when it verifies a
+signature, and it is the one age the request path does read: past the bound, a
+token naming a key the copy holds asks the issuer to confirm it first. If the
+issuer cannot be reached the cache answers `ErrUnavailable` — a `503` and an
+interval to wait, not a verdict on the token, because the signature was never
+checked against anything current. Unset, which is the default, there is no
+bound.
 
 The interval that `503` names is the one this cache is actually holding, because
 the failure carries it: what is left of `MinRefresh` when the next fetch was
@@ -288,11 +298,12 @@ defer stop()
 `MinRefresh` does not hold those fetches off — a ticker is already its own bound,
 and the period is what to tune instead — but each attempt is still recorded, so a
 scheduled fetch that has just happened holds the request path off exactly as one
-an arriving token triggered would. A period of zero is `CacheFor`. Nothing is
-fetched before the first tick, because the request path still fetches on demand.
-`stop` ends the ticker and waits for a fetch in flight. The error is the key set
-URL being one no fetch would accept, which a server learns at startup rather
-than from a goroutine failing quietly once a period.
+an arriving token triggered would. A period of zero is `CacheFor`, which is the
+setting that period belongs to. Nothing is fetched before the first tick,
+because the request path still fetches on demand. `stop` ends the ticker and
+waits for a fetch in flight. The error is the key set URL being one no fetch
+would accept, which a server learns at startup rather than from a goroutine
+failing quietly once a period.
 
 Two refusals happen at fetch time rather than verify time. A key set URL that is
 not `https` is refused before the first request, because a key set an attacker

@@ -31,18 +31,28 @@ type KeySource interface {
 // JWKS is an authorization server's published key set, fetched over HTTP and
 // held in memory.
 //
-// The cache is not a plain TTL, because rotation does not wait for one. An
-// issuer signs with a new key the moment it publishes it, so an unknown key id
-// refetches the set rather than refusing tokens until the TTL happens to lapse.
-// MinRefresh is what stops that from turning a stream of invented key ids into
-// a stream of requests at the issuer.
+// The cache is not a TTL. Rotation does not wait for one — an issuer signs with
+// a new key the moment it publishes it — so what asks for a fetch is a token
+// naming a key id the copy in memory does not hold, and MinRefresh is what
+// stops a stream of invented key ids from becoming a stream of requests at the
+// issuer. Nothing on the request path expires a key id the copy does hold:
+// CacheFor is the period Start refreshes on, and MaxStale is the one age the
+// request path reads, past which a copy nobody has confirmed stops answering.
 type JWKS struct {
 	// URL of the key set document. It has to be https outside localhost.
 	URL string
 	// Client used for the fetch. Defaults to one with a 10s timeout.
 	Client *http.Client
-	// CacheFor is how long a fetched set is served before it is fetched again.
+	// CacheFor is the period Start refreshes the set on when it is given none.
 	// Defaults to 15 minutes.
+	//
+	// It is not a staleness check: a key id the copy in memory holds is answered
+	// from it however long ago the set was fetched. A timer on the request path
+	// bought nothing it did not also charge for. Rotation does not wait for it —
+	// which is why an unknown key id refetches — so its lapse made whichever
+	// token happened to arrive next pay for a fetch without making the copy any
+	// more current for the key id that token already named. What a server wants
+	// instead is a schedule of its own, and this is that schedule's period.
 	CacheFor time.Duration
 	// MinRefresh is the shortest gap between two fetches an arriving token asks
 	// for, whatever about that token asks for one. Defaults to 30 seconds.
@@ -69,17 +79,18 @@ type JWKS struct {
 	MinRefresh time.Duration
 	// MaxStale bounds how long the last good set goes on answering once it can
 	// no longer be refreshed. It is measured from the fetch that produced the
-	// copy in memory, not from the point that copy went stale, so the value set
-	// here is the oldest a key may be when it verifies a signature rather than
-	// an extension of CacheFor. Zero, the default, is no bound: an issuer being
+	// copy in memory, so the value set here is the oldest a key may be when it
+	// verifies a signature. Zero, the default, is no bound: an issuer being
 	// unreachable is not evidence that the key it published stopped being its
 	// key, and the tokens it signed expire on their own.
 	//
 	// Setting it is the other reading of the same fact. A key the issuer has
 	// since retired keeps verifying tokens here for as long as the copy in
 	// memory answers, so a server that would rather refuse than verify against
-	// a set it can no longer confirm gives that copy an expiry date. Past the
-	// bound the cache answers ErrUnavailable — a 503 and an interval to wait,
+	// a set it can no longer confirm gives that copy an expiry date. It is the
+	// one age the request path reads: past the bound, a token naming a key the
+	// copy holds asks the issuer to confirm it, and when the issuer cannot be
+	// reached the cache answers ErrUnavailable — a 503 and an interval to wait,
 	// not a verdict on the token, because the signature still has not been
 	// checked against anything current.
 	MaxStale time.Duration
@@ -108,8 +119,9 @@ type JWKS struct {
 
 // KeySetRefresh is one fetch of the key set, as reported to OnRefresh.
 type KeySetRefresh struct {
-	// KeyID is the key id whose absence or staleness triggered the fetch. It is
-	// empty when no token did: a Refresh made on the server's own schedule.
+	// KeyID is the key id whose absence triggered the fetch, or whose key the
+	// copy in memory may no longer answer for unconfirmed. It is empty when no
+	// token triggered it: a Refresh made on the server's own schedule.
 	KeyID string
 	// KeyIDs are the usable key ids the fetched set carried, sorted. It is
 	// empty when the fetch produced no set.
@@ -123,8 +135,9 @@ type KeySetRefresh struct {
 
 const maxKeySetBytes = 1 << 20
 
-// Key returns the public key published under kid, fetching the set if it is not
-// held, has gone stale, or does not name that key id yet.
+// Key returns the public key published under kid, fetching the set if the copy
+// in memory does not name that key id, or if it was fetched longer than
+// MaxStale allows it to answer for without being confirmed.
 //
 // A fetch that fails with no copy of the set in memory is ErrUnavailable rather
 // than an unknown key: the issuer was never reached, so nothing has been
@@ -179,8 +192,9 @@ func (j *JWKS) Refresh(ctx context.Context) error {
 // that would rather keep the copy in memory warm than meet a rotation on the
 // request that needs it writes this goroutine either way.
 //
-// every is the period. Zero is CacheFor, which refreshes the copy about as
-// often as it would otherwise go stale. MinRefresh does not bound these
+// every is the period. Zero is CacheFor, which is what that setting is — the
+// schedule this cache is refreshed on, since nothing on the request path
+// expires a key id the copy in memory holds. MinRefresh does not bound these
 // fetches — the period already does — so the period is what to tune when the
 // issuer should be asked less often.
 //
@@ -245,22 +259,19 @@ func (j *JWKS) key(ctx context.Context, kid string) (crypto.PublicKey, *KeySetRe
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
+	// A key id the copy in memory holds is answered from it, however long ago
+	// that copy was fetched: asking the issuer again on a schedule is the
+	// server's own business, and MaxStale is the only age read here.
 	cached, known := j.keys[kid]
-	if known && !j.stale() {
+	if known && !j.beyondMaxStale() {
 		return cached, nil, nil
 	}
 	fetch, err := j.refresh(ctx, kid, arrivingToken)
 	if err != nil {
-		beyond := j.beyondMaxStale()
-		if known && !beyond {
-			// An issuer being unreachable is not evidence that the key it
-			// published stopped being its key. Tokens still expire on their own.
-			return cached, fetch, nil
-		}
 		if len(j.keys) == 0 {
 			return nil, fetch, fmt.Errorf("%w: no key set from %s is held: %w", ErrUnavailable, j.URL, err)
 		}
-		if beyond {
+		if j.beyondMaxStale() {
 			// The copy in memory outlived what it was allowed to answer for, so
 			// there is no verdict left to give: whether the issuer still
 			// publishes this key is no longer known.
@@ -383,13 +394,10 @@ func (j *JWKS) checkURL() error {
 	return nil
 }
 
-func (j *JWKS) stale() bool {
-	return j.fetched.IsZero() || j.now().Sub(j.fetched) >= j.cacheFor()
-}
-
 // beyondMaxStale reports whether the copy in memory is older than MaxStale lets
 // it keep answering for. The age is measured from the fetch that produced it,
-// so a long CacheFor does not quietly extend the bound.
+// so the bound configured is the oldest a key may be when it verifies a
+// signature rather than one term of a sum.
 func (j *JWKS) beyondMaxStale() bool {
 	if j.MaxStale <= 0 || j.fetched.IsZero() {
 		return false
